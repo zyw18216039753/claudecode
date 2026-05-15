@@ -111,15 +111,19 @@ class WindFarmSystem:
         self.n_wt  = 3
         self.n_svg = 1
         self.n_cap = 1
-        self.n_dev = self.n_wt + self.n_svg + self.n_cap  # 5
+        self.n_oltc = 1
+        self.n_dev = self.n_wt + self.n_svg + self.n_cap + self.n_oltc  # 6
+
+        # 设备索引 (在24h展开中的offset)
+        self.idx_wt   = [0, 1, 2]
+        self.idx_svg  = 3
+        self.idx_cap  = 4
+        self.idx_oltc = 5
 
         # 搜索空间维度 = 设备数 × 24时段
         self.dim = self.n_dev * 24
 
         # ---- 设备无功出力范围 (pu on SB) — 工程实际尺度 ----
-        # DFIG双馈风机典型无功容量: ±0.3~0.4 pu of rated P
-        # WT1/WT2: 3.0MW → P_max=0.30pu,  Q范围 ±0.25pu
-        # WT3:     2.5MW → P_max=0.25pu,  Q范围 ±0.20pu
         self.wt_q_min  = np.array([-0.25, -0.25, -0.20])
         self.wt_q_max  = np.array([ 0.25,  0.25,  0.20])
         self.svg_q_min = -0.30
@@ -127,15 +131,28 @@ class WindFarmSystem:
         self.cap_q_min =  0.00
         self.cap_q_max =  0.20
 
+        # ---- 离散电容器分组投切 ----
+        # 5组电容器, 每组0.04pu, 构成6档: [0, 0.04, 0.08, 0.12, 0.16, 0.20] pu
+        self.cap_step = 0.04
+        self.cap_n_steps = 5
+        self.cap_steps = np.arange(0, self.cap_n_steps + 1) * self.cap_step
+        self.max_cap_switches = 5  # 每日最大投切次数
+
+        # ---- 有载调压变压器 (OLTC) ----
+        # 9档位: ±10%, 步长2.5%
+        self.oltc_tap_min = -4
+        self.oltc_tap_max = 4
+        self.oltc_step_pu = 0.025
+        self.max_oltc_changes = 6  # 每日最大分接头变化次数
+
         # ---- 无功圆约束 (视在功率额定值) ----
-        # WT1/WT2: S=0.40pu (4.0MVA, 适配3MW DFIG)
-        # WT3:     S=0.32pu (3.2MVA, 适配2.5MW DFIG)
         self.S_wt = np.array([0.40, 0.40, 0.32])
         self.S_svg = 0.30
+        self.S_svg = 0.30
 
-        # 盒式上下限
-        ql_per_h = np.concatenate([self.wt_q_min, [self.svg_q_min], [self.cap_q_min]])
-        qu_per_h = np.concatenate([self.wt_q_max, [self.svg_q_max], [self.cap_q_max]])
+        # 盒式上下限 (含OLTC档位)
+        ql_per_h = np.concatenate([self.wt_q_min, [self.svg_q_min], [self.cap_q_min], [self.oltc_tap_min]])
+        qu_per_h = np.concatenate([self.wt_q_max, [self.svg_q_max], [self.cap_q_max], [self.oltc_tap_max]])
         self.lb = np.tile(ql_per_h, 24)
         self.ub = np.tile(qu_per_h, 24)
 
@@ -184,24 +201,23 @@ class PowerFlow:
         self.tol = 1e-8
         self.max_iter = 30
 
-    def solve(self, P_inj, Q_inj):
+    def solve(self, P_inj, Q_inj, V_slack=1.0):
         """
-        输入: P_inj[n], Q_inj[n]  各节点注入功率
+        输入: P_inj[n], Q_inj[n], V_slack (OLTC调节后的平衡节点电压)
         输出: V[n], theta[n], converged
         """
         sys = self.sys
         G, B = sys.G, sys.B
         n = sys.n_nodes
         slack = sys.slack_node
-        pq = sys.pq_nodes   # [4,5,6]
-        pv = sys.pv_nodes   # [1,2,3]
+        pq = sys.pq_nodes
+        pv = sys.pv_nodes
 
-        # 非平衡节点编号
-        non_slack = np.concatenate([pv, pq])  # [1,2,3,4,5,6]
+        non_slack = np.concatenate([pv, pq])
         n_ns = len(non_slack)
 
-        # 初始电压
         V = np.ones(n)
+        V[slack] = V_slack  # OLTC调节平衡节点电压
         theta = np.zeros(n)
 
         # 未知量索引: dθ for all non-slack, then dV for PQ only
@@ -315,21 +331,36 @@ class FitnessEvaluator:
     def __init__(self, sys: WindFarmSystem):
         self.sys = sys
         self.pf = PowerFlow(sys)
-        # 权重系数（改进4: 灵敏度分析中会改变这些值）
         self.w1 = 0.30         # 有功损耗
         self.w2_rise = 0.15    # 电压升高偏差
         self.w2_drop = 0.30    # 电压跌落偏差
         self.w3 = 0.10         # 跨时段无功变化率 ΔQ
         self.lam = 150.0       # 电压越限惩罚
         self.mu = 80.0         # 无功圆约束惩罚
+        self.lam_cap_sw = 8.0  # 电容器日投切次数超标惩罚
+        self.lam_oltc = 5.0    # OLTC日分接头变化次数超标惩罚
 
     def evaluate(self, position):
         """
         position: (n_dev * 24,) 决策变量向量
+        设备顺序: WT1, WT2, WT3, SVG, Cap(离散), OLTC(离散)
         返回: (fitness, metrics_dict)
         """
         sys = self.sys
-        Q_dev = position.reshape(24, sys.n_dev)  # (24, 5)
+        raw = position.reshape(24, sys.n_dev)
+
+        # ---- 离散化 ----
+        Q_dev = raw.copy()
+        # 电容器量化到最近档位
+        cap_raw = raw[:, sys.idx_cap]
+        cap_q = np.round(cap_raw / sys.cap_step) * sys.cap_step
+        cap_q = np.clip(cap_q, 0.0, sys.cap_n_steps * sys.cap_step)
+        Q_dev[:, sys.idx_cap] = cap_q
+        # OLTC量化到最近整数档位
+        oltc_raw = raw[:, sys.idx_oltc]
+        oltc_tap = np.round(oltc_raw).astype(int)
+        oltc_tap = np.clip(oltc_tap, sys.oltc_tap_min, sys.oltc_tap_max)
+        Q_dev[:, sys.idx_oltc] = oltc_tap.astype(float)
 
         total_P_loss = 0.0
         total_Q_loss = 0.0
@@ -339,7 +370,7 @@ class FitnessEvaluator:
         total_delta_Q = 0.0
         total_circle_pen = 0.0
         V_profile = np.zeros((24, sys.n_nodes))
-        Q_applied = np.zeros_like(Q_dev)  # 记录圆约束裁剪后的实际Q
+        Q_applied = Q_dev.copy()
         P_loss_h = np.zeros(24)
         Q_loss_h = np.zeros(24)
         V_dev_h  = np.zeros(24)
@@ -347,8 +378,7 @@ class FitnessEvaluator:
         for h in range(24):
             q = Q_dev[h].copy()
 
-            # ---- 改进2: 无功圆约束 ----
-            # 风机无功: Q² ≤ S_wt² − P_wt²
+            # ---- 无功圆约束 (WT + SVG) ----
             for w in range(sys.n_wt):
                 S = sys.S_wt[w]
                 P = sys.P_wt[w, h]
@@ -357,11 +387,9 @@ class FitnessEvaluator:
                     total_circle_pen += (abs(q[w]) - max_q_h)**2
                     q[w] = np.clip(q[w], -max_q_h, max_q_h)
 
-            # SVG无功: Q² ≤ S_svg² (SVG无有功出力)
-            max_q_svg = sys.S_svg
-            if abs(q[sys.n_wt]) > max_q_svg:
-                total_circle_pen += (abs(q[sys.n_wt]) - max_q_svg)**2
-                q[sys.n_wt] = np.clip(q[sys.n_wt], -max_q_svg, max_q_svg)
+            if abs(q[sys.idx_svg]) > sys.S_svg:
+                total_circle_pen += (abs(q[sys.idx_svg]) - sys.S_svg)**2
+                q[sys.idx_svg] = np.clip(q[sys.idx_svg], -sys.S_svg, sys.S_svg)
 
             Q_applied[h] = q
 
@@ -369,34 +397,33 @@ class FitnessEvaluator:
             P_inj = np.zeros(sys.n_nodes)
             Q_inj = np.zeros(sys.n_nodes)
 
-            # 风机有功注入
             for w in range(sys.n_wt):
                 P_inj[sys.wt_nodes[w]] = sys.P_wt[w, h]
 
-            # 负荷 (负注入)
             P_inj[sys.load_node] = -sys.P_load[h]
             Q_inj[sys.load_node] = -sys.Q_load[h]
 
-            # 设备无功注入 (使用圆约束裁剪后的值)
             for w in range(sys.n_wt):
                 Q_inj[sys.wt_nodes[w]] = q[w]
-            Q_inj[sys.svg_node] = q[sys.n_wt]
-            Q_inj[sys.cap_node] = q[sys.n_wt + 1]
+            Q_inj[sys.svg_node] = q[sys.idx_svg]
+            Q_inj[sys.cap_node] = q[sys.idx_cap]
 
-            # 潮流计算
-            V, theta, ok = self.pf.solve(P_inj, Q_inj)
+            # OLTC调节平衡节点电压
+            tap = int(q[sys.idx_oltc])
+            V_slack = 1.0 + tap * sys.oltc_step_pu
+
+            V, theta, ok = self.pf.solve(P_inj, Q_inj, V_slack=V_slack)
             if not ok:
                 return 1e10, {
                     'P_loss': 1e10, 'V_rise': 1e10, 'V_drop': 1e10,
                     'Q_loss': 1e10, 'V_pen': 1e10, 'delta_Q': 1e10,
-                    'circle_pen': 1e10,
+                    'circle_pen': 1e10, 'cap_sw_pen': 1e10, 'oltc_pen': 1e10,
                     'converged': False, 'V_profile': None, 'Q_applied': None,
                     'P_loss_h': None, 'Q_loss_h': None, 'V_dev_h': None,
                 }
 
             V_profile[h] = V
 
-            # 线路有功/无功损耗 (S_loss = |ΔV|² * y* = |ΔV|² * (g + jb))
             for line_idx, (f, t, r, x) in enumerate(sys.lines):
                 f, t = int(f), int(t)
                 g = sys.line_g[line_idx]
@@ -410,7 +437,6 @@ class FitnessEvaluator:
                 P_loss_h[h] += P_loss_ij
                 Q_loss_h[h] += Q_loss_ij
 
-            # 电压偏差 (合并升高+跌落, 用于画图)
             v_dev_sum = 0.0
             for i in range(sys.n_nodes):
                 dv = V[i] - sys.V_ref
@@ -421,24 +447,38 @@ class FitnessEvaluator:
                     total_V_drop += dv**2
             V_dev_h[h] = v_dev_sum
 
-            # 电压越限惩罚
             for i in range(sys.n_nodes):
                 if V[i] < sys.V_min:
                     total_V_pen += (sys.V_min - V[i])**2
                 elif V[i] > sys.V_max:
                     total_V_pen += (V[i] - sys.V_max)**2
 
-        # ---- 改进1+7: 跨时段无功变化率 (替代原专利Δu) ----
+        # ---- 跨时段无功变化率 (仅Q设备, 不含OLTC) ----
+        n_q_dev = sys.n_wt + sys.n_svg + sys.n_cap
         for h in range(23):
-            for d in range(sys.n_dev):
+            for d in range(n_q_dev):
                 total_delta_Q += (Q_applied[h+1, d] - Q_applied[h, d])**2
+
+        # ---- 日投切/调压次数约束 ----
+        cap_sw_pen = 0.0
+        oltc_pen = 0.0
+        for h in range(23):
+            if abs(Q_applied[h+1, sys.idx_cap] - Q_applied[h, sys.idx_cap]) > 1e-6:
+                cap_sw_pen += 1
+        cap_sw_pen = max(0, cap_sw_pen - sys.max_cap_switches) * self.lam_cap_sw
+
+        for h in range(23):
+            if Q_applied[h+1, sys.idx_oltc] != Q_applied[h, sys.idx_oltc]:
+                oltc_pen += 1
+        oltc_pen = max(0, oltc_pen - sys.max_oltc_changes) * self.lam_oltc
 
         fitness = (self.w1 * total_P_loss +
                    self.w2_rise * total_V_rise +
                    self.w2_drop * total_V_drop +
                    self.w3 * total_delta_Q +
                    self.lam * total_V_pen +
-                   self.mu * total_circle_pen)
+                   self.mu * total_circle_pen +
+                   cap_sw_pen + oltc_pen)
 
         return fitness, {
             'P_loss': total_P_loss,
@@ -448,6 +488,8 @@ class FitnessEvaluator:
             'V_pen': total_V_pen,
             'delta_Q': total_delta_Q,
             'circle_pen': total_circle_pen,
+            'cap_sw_pen': cap_sw_pen,
+            'oltc_pen': oltc_pen,
             'converged': True,
             'V_profile': V_profile,
             'Q_applied': Q_applied,
@@ -740,8 +782,10 @@ def main():
     print("\n[1/5] Building test system...")
     sys = WindFarmSystem()
     print(f"  Nodes: {sys.n_nodes} | Devices: {sys.n_dev} "
-          f"(WT:{sys.n_wt} SVG:1 Cap:1)")
+          f"(WT:{sys.n_wt} SVG:1 Cap:1 OLTC:1)")
     print(f"  Search dimension: {sys.dim} (= {sys.n_dev} devices x 24h)")
+    print(f"  Cap: discrete {sys.cap_n_steps+1} steps, OLTC: 9 taps, "
+          f"max_sw={sys.max_cap_switches}/{sys.max_oltc_changes}")
 
     # [2] 初始化评估器
     print("\n[2/5] Initializing evaluator (Newton-Raphson PF)...")
@@ -760,6 +804,8 @@ def main():
     print(f"  Q_loss = {metrics_igwo['Q_loss']:.6f} pu")
     print(f"  V_rise = {metrics_igwo['V_rise']:.6f}")
     print(f"  V_drop = {metrics_igwo['V_drop']:.6f}")
+    print(f"  Cap_sw_pen = {metrics_igwo.get('cap_sw_pen',0):.4f} | "
+          f"OLTC_pen = {metrics_igwo.get('oltc_pen',0):.4f}")
 
     # [4] 运行标准GWO对比
     print("\n[4/5] Running Standard GWO for comparison...")
@@ -772,17 +818,20 @@ def main():
     # [5] 输出结果
     Q_opt = best_igwo.reshape(24, sys.n_dev)
 
-    print("\n[5/5] Optimal dispatch (selected hours, in MVar):")
+    print("\n[5/5] Optimal dispatch (Q in MVar, OLTC as tap position):")
     hdr = f"  {'Hour':>6s}"
-    for d in ['WT1', 'WT2', 'WT3', 'SVG', 'Cap']:
+    for d in ['WT1', 'WT2', 'WT3', 'SVG', 'Cap(MVar)', 'OLTC(tap)']:
         hdr += f" {d:>10s}"
     print(hdr)
-    print("  " + "-" * 58)
+    print("  " + "-" * 70)
+    n_q = sys.n_wt + sys.n_svg + sys.n_cap
     for h in [0, 6, 12, 18, 23]:
-        vals = Q_opt[h] * sys.SB
+        q_vals = Q_opt[h, :n_q] * sys.SB    # MVar
+        oltc = int(Q_opt[h, sys.idx_oltc])  # tap
         line = f"  {h:02d}:00  "
-        for v in vals:
+        for v in q_vals:
             line += f" {v:8.4f} "
+        line += f" {oltc:10d}"
         print(line)
 
     # 优化前基准
