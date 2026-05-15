@@ -20,11 +20,16 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # 非交互后端，无需GUI
 import matplotlib.pyplot as plt
-import time
+import time, os.path as _osp
 
-# ---- 中文字体设置 ----
-plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'DejaVu Sans']
-plt.rcParams['axes.unicode_minus'] = False
+# ---- Figura: IEEE publication-quality figure setup ----
+import sys as _sys
+_sys.path.insert(0, r"C:\Users\18771\.claude\plugins\cache\figura\figura\0.4.0\skills\figura\scripts")
+import pubstyle, colors, export
+pubstyle.apply(venue="ieee")
+colors.apply_cycle()
+# CJK fallback: 保留IEEE主字体, 中文回退到SimHei
+plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'SimHei', 'Microsoft YaHei', 'sans-serif']
 
 # ============================================================================
 # 第1部分：测试系统 — 7节点新能源发电系统
@@ -36,7 +41,7 @@ class WindFarmSystem:
 
     拓扑:
       Node 0: PCC平衡节点 (V=1.0∠0°)
-      Node 1-3: 直驱风机 WT1, WT2, WT3 (PV节点, P=给定)
+      Node 1-3: 直驱风机 WT1, WT2, WT3 (PQ节点, 按Q设定值调节)
       Node 4: SVG安装点 (PQ节点)
       Node 5: 电容器组安装点 (PQ节点)
       Node 6: 负荷节点 (PQ节点)
@@ -58,16 +63,16 @@ class WindFarmSystem:
         self.n_nodes = 7
         self.n_time = 24
 
-        # 线路: [from, to, R(pu), X(pu)]
+        # 线路: [from, to, R(pu), X(pu)]  — ×6增强, 模拟更长馈线
         lines = np.array([
-            [0, 1, 0.003, 0.012],
-            [0, 2, 0.005, 0.018],
-            [0, 6, 0.002, 0.008],
-            [1, 4, 0.001, 0.004],
-            [2, 5, 0.001, 0.004],
-            [3, 4, 0.002, 0.008],
-            [4, 5, 0.001, 0.003],
-            [5, 6, 0.001, 0.005],
+            [0, 1, 0.018, 0.072],
+            [0, 2, 0.030, 0.108],
+            [0, 6, 0.012, 0.048],
+            [1, 4, 0.006, 0.024],
+            [2, 5, 0.006, 0.024],
+            [3, 4, 0.012, 0.048],
+            [4, 5, 0.006, 0.018],
+            [5, 6, 0.006, 0.030],
         ])
         self.n_lines = len(lines)
 
@@ -89,8 +94,8 @@ class WindFarmSystem:
         # 线路电导 g_ij = R/(R²+X²) > 0 (用于计算P_loss, 区别于Ybus非对角元G_ij<0)
         self.line_g = np.array([r/(r*r + x*x) for _, _, r, x in lines])
 
-        # 节点类型: 0=slack, 1=PQ, 2=PV
-        self.node_type = np.array([0, 2, 2, 2, 1, 1, 1])
+        # 节点类型: 0=slack, 1=PQ (风机改为PQ, Q调度直接影响电压)
+        self.node_type = np.array([0, 1, 1, 1, 1, 1, 1])
         self.slack_node = 0
         self.pq_nodes = np.where(self.node_type == 1)[0]   # [4, 5, 6]
         self.pv_nodes = np.where(self.node_type == 2)[0]   # [1, 2, 3]
@@ -109,20 +114,20 @@ class WindFarmSystem:
         # 搜索空间维度 = 设备数 × 24时段
         self.dim = self.n_dev * 24
 
-        # ---- 设备无功出力范围 (pu on SB) ----
-        self.wt_q_min  = np.array([-0.08, -0.08, -0.06])
-        self.wt_q_max  = np.array([ 0.08,  0.08,  0.06])
-        self.svg_q_min = -0.10
-        self.svg_q_max =  0.10
+        # ---- 设备无功出力范围 (pu on SB) — 扩大范围 ----
+        self.wt_q_min  = np.array([-0.15, -0.15, -0.12])
+        self.wt_q_max  = np.array([ 0.15,  0.15,  0.12])
+        self.svg_q_min = -0.20
+        self.svg_q_max =  0.20
         self.cap_q_min =  0.00
-        self.cap_q_max =  0.06
+        self.cap_q_max =  0.10
 
         # ---- 改进2: 无功圆约束参数 (视在功率额定值) ----
         # 风机: S_wt = √(P_max²+Q_max²), 保证满发时仍有无功裕度
-        #  WT1/WT2: P_max=2MW→0.20pu, Q_max=0.08pu → S≈√(0.20²+0.08²)=0.2155pu (2.155MVA)
-        #  WT3:     P_max=1.5MW→0.15pu, Q_max=0.06pu → S≈√(0.15²+0.06²)=0.1616pu (1.616MVA)
-        self.S_wt = np.array([0.2155, 0.2155, 0.1616])  # pu
-        self.S_svg = 0.10  # pu, SVG无有功出力, S=Q_max
+        #  WT1/WT2: P_max=2MW→0.20pu, Q_max=0.15pu → S≈√(0.20²+0.15²)=0.250pu (2.50MVA)
+        #  WT3:     P_max=1.5MW→0.15pu, Q_max=0.12pu → S≈√(0.15²+0.12²)=0.192pu (1.92MVA)
+        self.S_wt = np.array([0.250, 0.250, 0.192])  # pu
+        self.S_svg = 0.20  # pu, SVG无有功出力, S=Q_max
 
         # 每时段静态盒式上下限（用于初始化和基础边界）
         ql_per_h = np.concatenate([self.wt_q_min, [self.svg_q_min], [self.cap_q_min]])
@@ -162,8 +167,8 @@ class WindFarmSystem:
             0.92, 0.95, 0.97, 0.93, 0.88, 0.90, 0.95, 0.98,
             1.00, 0.95, 0.88, 0.82, 0.75, 0.70, 0.62, 0.55
         ])
-        self.P_load = load_ratio * 3.0 / self.SB   # 峰值3MW
-        self.Q_load = load_ratio * 1.2 / self.SB   # 峰值1.2MVar
+        self.P_load = load_ratio * 5.0 / self.SB   # 峰值5MW (增大负荷应力)
+        self.Q_load = load_ratio * 2.0 / self.SB   # 峰值2.0MVar
 
 
 # ============================================================================
@@ -312,8 +317,8 @@ class FitnessEvaluator:
         # 权重系数（改进4: 灵敏度分析中会改变这些值）
         self.w1 = 0.30         # 有功损耗
         self.w2_rise = 0.15    # 电压升高偏差
-        self.w2_drop = 0.20    # 电压跌落偏差 (跌落通常比升高更危险, 权重稍高)
-        self.w3 = 0.15         # 跨时段无功变化率 ΔQ
+        self.w2_drop = 0.30    # 电压跌落偏差 (增大权重)
+        self.w3 = 0.05         # 跨时段无功变化率 ΔQ (降低, 避免压制Q调度)
         self.lam = 100.0       # 电压越限惩罚系数
         self.mu = 50.0         # 无功圆约束惩罚系数
 
@@ -765,8 +770,10 @@ def sensitivity_analysis(sys, base_evaluator, save_to=None):
 
     plt.tight_layout()
     if save_to:
-        plt.savefig(save_to, dpi=150, bbox_inches='tight')
-        print(f"\n  [Sensitivity fig saved] {save_to}")
+        _stem = _osp.splitext(_osp.basename(save_to))[0]
+        _dir = _osp.dirname(save_to) or "."
+        export.save(fig, _stem, outdir=_dir, formats=("pdf", "png"))
+        print(f"\n  [Sensitivity fig saved] {_dir}/{_stem}.{{pdf,png}}")
     plt.close()
     return results_w1, results_w3
 
@@ -908,8 +915,10 @@ def plot_results(sys, best_pos, best_fit, curve_igwo, a_vals, metrics,
 
     plt.tight_layout()
     if save_to:
-        plt.savefig(save_to, dpi=150, bbox_inches='tight')
-        print(f"[Fig saved] {save_to}")
+        _stem = _osp.splitext(_osp.basename(save_to))[0]
+        _dir = _osp.dirname(save_to) or "."
+        export.save(fig, _stem, outdir=_dir, formats=("pdf", "png"))
+        print(f"[Fig saved] {_dir}/{_stem}.{{pdf,png}}")
     plt.close()
     return fig
 
