@@ -63,16 +63,18 @@ class WindFarmSystem:
         self.n_nodes = 7
         self.n_time = 24
 
-        # 线路: [from, to, R(pu), X(pu)]  — ×6增强, 模拟更长馈线
+        # 线路: [from, to, R(pu), X(pu)]
+        # 35kV农网长馈线 (25-40km), ACSR-120导线: R≈0.27 Ω/km, X≈0.35 Ω/km
+        # Z_base = 35²/10 = 122.5 Ω, per-unit ≈ 0.0022/km
         lines = np.array([
-            [0, 1, 0.018, 0.072],
-            [0, 2, 0.030, 0.108],
-            [0, 6, 0.012, 0.048],
-            [1, 4, 0.006, 0.024],
-            [2, 5, 0.006, 0.024],
-            [3, 4, 0.012, 0.048],
-            [4, 5, 0.006, 0.018],
-            [5, 6, 0.006, 0.030],
+            [0, 1, 0.088, 0.280],   # 0→WT1 主干 ~35km
+            [0, 2, 0.100, 0.320],   # 0→WT2 主干 ~40km
+            [0, 6, 0.130, 0.400],   # 0→负荷 主干 ~50km (远端)
+            [1, 4, 0.044, 0.140],   # WT1→SVG 分支 ~18km
+            [2, 5, 0.044, 0.140],   # WT2→Cap 分支 ~18km
+            [3, 4, 0.066, 0.210],   # WT3→SVG 分支 ~27km
+            [4, 5, 0.055, 0.175],   # SVG↔Cap 联络 ~22km
+            [5, 6, 0.033, 0.105],   # Cap→负荷 末端 ~13km
         ])
         self.n_lines = len(lines)
 
@@ -91,20 +93,20 @@ class WindFarmSystem:
 
         # 存储线路数据用于损耗计算
         self.lines = np.array(lines)
-        # 线路电导 g_ij = R/(R²+X²) > 0 (用于计算P_loss, 区别于Ybus非对角元G_ij<0)
         self.line_g = np.array([r/(r*r + x*x) for _, _, r, x in lines])
+        self.line_b = np.array([x/(r*r + x*x) for _, _, r, x in lines])
 
-        # 节点类型: 0=slack, 1=PQ (风机改为PQ, Q调度直接影响电压)
+        # 节点类型: 0=slack, 1=PQ
         self.node_type = np.array([0, 1, 1, 1, 1, 1, 1])
         self.slack_node = 0
-        self.pq_nodes = np.where(self.node_type == 1)[0]   # [4, 5, 6]
-        self.pv_nodes = np.where(self.node_type == 2)[0]   # [1, 2, 3]
+        self.pq_nodes = np.where(self.node_type == 1)[0]
+        self.pv_nodes = np.where(self.node_type == 2)[0]
 
         # 设备节点映射
-        self.wt_nodes  = [1, 2, 3]    # 风机 (PV节点)
-        self.svg_node  = 4            # SVG
-        self.cap_node  = 5            # 电容器
-        self.load_node = 6            # 负荷
+        self.wt_nodes  = [1, 2, 3]
+        self.svg_node  = 4
+        self.cap_node  = 5
+        self.load_node = 6
 
         self.n_wt  = 3
         self.n_svg = 1
@@ -114,30 +116,30 @@ class WindFarmSystem:
         # 搜索空间维度 = 设备数 × 24时段
         self.dim = self.n_dev * 24
 
-        # ---- 设备无功出力范围 (pu on SB) — 扩大范围 ----
-        self.wt_q_min  = np.array([-0.15, -0.15, -0.12])
-        self.wt_q_max  = np.array([ 0.15,  0.15,  0.12])
-        self.svg_q_min = -0.20
-        self.svg_q_max =  0.20
+        # ---- 设备无功出力范围 (pu on SB) — 工程实际尺度 ----
+        # DFIG双馈风机典型无功容量: ±0.3~0.4 pu of rated P
+        # WT1/WT2: 3.0MW → P_max=0.30pu,  Q范围 ±0.25pu
+        # WT3:     2.5MW → P_max=0.25pu,  Q范围 ±0.20pu
+        self.wt_q_min  = np.array([-0.25, -0.25, -0.20])
+        self.wt_q_max  = np.array([ 0.25,  0.25,  0.20])
+        self.svg_q_min = -0.30
+        self.svg_q_max =  0.30
         self.cap_q_min =  0.00
-        self.cap_q_max =  0.10
+        self.cap_q_max =  0.20
 
-        # ---- 改进2: 无功圆约束参数 (视在功率额定值) ----
-        # 风机: S_wt = √(P_max²+Q_max²), 保证满发时仍有无功裕度
-        #  WT1/WT2: P_max=2MW→0.20pu, Q_max=0.15pu → S≈√(0.20²+0.15²)=0.250pu (2.50MVA)
-        #  WT3:     P_max=1.5MW→0.15pu, Q_max=0.12pu → S≈√(0.15²+0.12²)=0.192pu (1.92MVA)
-        self.S_wt = np.array([0.250, 0.250, 0.192])  # pu
-        self.S_svg = 0.20  # pu, SVG无有功出力, S=Q_max
+        # ---- 无功圆约束 (视在功率额定值) ----
+        # WT1/WT2: S=0.40pu (4.0MVA, 适配3MW DFIG)
+        # WT3:     S=0.32pu (3.2MVA, 适配2.5MW DFIG)
+        self.S_wt = np.array([0.40, 0.40, 0.32])
+        self.S_svg = 0.30
 
-        # 每时段静态盒式上下限（用于初始化和基础边界）
+        # 盒式上下限
         ql_per_h = np.concatenate([self.wt_q_min, [self.svg_q_min], [self.cap_q_min]])
         qu_per_h = np.concatenate([self.wt_q_max, [self.svg_q_max], [self.cap_q_max]])
         self.lb = np.tile(ql_per_h, 24)
         self.ub = np.tile(qu_per_h, 24)
 
-        # ---- 改进6: 电压约束具体参数 ----
-        # V_min=0.90pu, V_max=1.10pu (IEC 60038允许±10%范围)
-        # V_ref=1.00pu (标称电压)
+        # ---- 电压约束 ----
         self.V_min = 0.90
         self.V_max = 1.10
         self.V_ref = 1.00
@@ -146,29 +148,28 @@ class WindFarmSystem:
         self._build_profiles()
 
     def _build_profiles(self):
-        """构建24h典型风电出力和负荷曲线"""
-        t = np.arange(24)
-
-        # 风电出力比（夜晚高/白天低的反调峰特性）
+        """构建24h典型风电出力和负荷曲线 (工程实际尺度)"""
+        # 风电出力比 (反调峰: 夜高昼低)
         wt_ratio = np.array([
             0.85, 0.88, 0.90, 0.87, 0.82, 0.75, 0.65, 0.55,
             0.45, 0.40, 0.38, 0.35, 0.33, 0.36, 0.42, 0.52,
             0.65, 0.75, 0.82, 0.85, 0.88, 0.90, 0.92, 0.88
         ])
-        wt_rated_MW = np.array([2.0, 2.0, 1.5])
+        # 风机额定功率 (MW): WT1=3.0, WT2=3.0, WT3=2.5 → 总装机8.5MW
+        wt_rated_MW = np.array([3.0, 3.0, 2.5])
 
         self.P_wt = np.zeros((self.n_wt, 24))
         for i in range(self.n_wt):
             self.P_wt[i, :] = wt_ratio * wt_rated_MW[i] / self.SB
 
-        # 负荷曲线（白天高/夜晚低）
+        # 负荷曲线 (昼高夜低), 峰值9MW/4.0MVar (重载农网馈线)
         load_ratio = np.array([
             0.50, 0.45, 0.42, 0.40, 0.42, 0.55, 0.72, 0.85,
             0.92, 0.95, 0.97, 0.93, 0.88, 0.90, 0.95, 0.98,
             1.00, 0.95, 0.88, 0.82, 0.75, 0.70, 0.62, 0.55
         ])
-        self.P_load = load_ratio * 5.0 / self.SB   # 峰值5MW (增大负荷应力)
-        self.Q_load = load_ratio * 2.0 / self.SB   # 峰值2.0MVar
+        self.P_load = load_ratio * 9.0 / self.SB   # 峰值9MW (0.90 pu)
+        self.Q_load = load_ratio * 4.0 / self.SB   # 峰值4.0MVar (0.40 pu)
 
 
 # ============================================================================
@@ -317,10 +318,10 @@ class FitnessEvaluator:
         # 权重系数（改进4: 灵敏度分析中会改变这些值）
         self.w1 = 0.30         # 有功损耗
         self.w2_rise = 0.15    # 电压升高偏差
-        self.w2_drop = 0.30    # 电压跌落偏差 (增大权重)
-        self.w3 = 0.05         # 跨时段无功变化率 ΔQ (降低, 避免压制Q调度)
-        self.lam = 100.0       # 电压越限惩罚系数
-        self.mu = 50.0         # 无功圆约束惩罚系数
+        self.w2_drop = 0.30    # 电压跌落偏差
+        self.w3 = 0.10         # 跨时段无功变化率 ΔQ
+        self.lam = 150.0       # 电压越限惩罚
+        self.mu = 80.0         # 无功圆约束惩罚
 
     def evaluate(self, position):
         """
@@ -331,6 +332,7 @@ class FitnessEvaluator:
         Q_dev = position.reshape(24, sys.n_dev)  # (24, 5)
 
         total_P_loss = 0.0
+        total_Q_loss = 0.0
         total_V_rise  = 0.0
         total_V_drop  = 0.0
         total_V_pen   = 0.0
@@ -338,6 +340,9 @@ class FitnessEvaluator:
         total_circle_pen = 0.0
         V_profile = np.zeros((24, sys.n_nodes))
         Q_applied = np.zeros_like(Q_dev)  # 记录圆约束裁剪后的实际Q
+        P_loss_h = np.zeros(24)
+        Q_loss_h = np.zeros(24)
+        V_dev_h  = np.zeros(24)
 
         for h in range(24):
             q = Q_dev[h].copy()
@@ -383,28 +388,38 @@ class FitnessEvaluator:
             if not ok:
                 return 1e10, {
                     'P_loss': 1e10, 'V_rise': 1e10, 'V_drop': 1e10,
-                    'V_pen': 1e10, 'delta_Q': 1e10, 'circle_pen': 1e10,
-                    'converged': False, 'V_profile': None, 'Q_applied': None
+                    'Q_loss': 1e10, 'V_pen': 1e10, 'delta_Q': 1e10,
+                    'circle_pen': 1e10,
+                    'converged': False, 'V_profile': None, 'Q_applied': None,
+                    'P_loss_h': None, 'Q_loss_h': None, 'V_dev_h': None,
                 }
 
             V_profile[h] = V
 
-            # 线路有功损耗
+            # 线路有功/无功损耗 (S_loss = |ΔV|² * y* = |ΔV|² * (g + jb))
             for line_idx, (f, t, r, x) in enumerate(sys.lines):
                 f, t = int(f), int(t)
                 g = sys.line_g[line_idx]
+                b = sys.line_b[line_idx]
                 ang = theta[f] - theta[t]
-                P_loss_ij = g * (V[f]**2 + V[t]**2 -
-                                 2 * V[f] * V[t] * np.cos(ang))
+                dV2 = V[f]**2 + V[t]**2 - 2 * V[f] * V[t] * np.cos(ang)
+                P_loss_ij = g * dV2
+                Q_loss_ij = b * dV2
                 total_P_loss += P_loss_ij
+                total_Q_loss += Q_loss_ij
+                P_loss_h[h] += P_loss_ij
+                Q_loss_h[h] += Q_loss_ij
 
-            # ---- 改进3: 拆分电压升高和跌落 ----
+            # 电压偏差 (合并升高+跌落, 用于画图)
+            v_dev_sum = 0.0
             for i in range(sys.n_nodes):
                 dv = V[i] - sys.V_ref
+                v_dev_sum += dv**2
                 if dv > 0:
                     total_V_rise += dv**2
                 else:
                     total_V_drop += dv**2
+            V_dev_h[h] = v_dev_sum
 
             # 电压越限惩罚
             for i in range(sys.n_nodes):
@@ -414,7 +429,6 @@ class FitnessEvaluator:
                     total_V_pen += (V[i] - sys.V_max)**2
 
         # ---- 改进1+7: 跨时段无功变化率 (替代原专利Δu) ----
-        # 罚相邻时段设备无功出力的跳变，建立真正的全天时耦合
         for h in range(23):
             for d in range(sys.n_dev):
                 total_delta_Q += (Q_applied[h+1, d] - Q_applied[h, d])**2
@@ -428,6 +442,7 @@ class FitnessEvaluator:
 
         return fitness, {
             'P_loss': total_P_loss,
+            'Q_loss': total_Q_loss,
             'V_rise': total_V_rise,
             'V_drop': total_V_drop,
             'V_pen': total_V_pen,
@@ -436,6 +451,9 @@ class FitnessEvaluator:
             'converged': True,
             'V_profile': V_profile,
             'Q_applied': Q_applied,
+            'P_loss_h': P_loss_h,
+            'Q_loss_h': Q_loss_h,
+            'V_dev_h': V_dev_h,
         }
 
 
@@ -624,303 +642,87 @@ class StandardGWO:
             alpha_fit = fit[order[0]]
             curve[t] = alpha_fit
 
-        return alpha_pos, alpha_fit, curve
+        _, final_m = self.eval_fn.evaluate(alpha_pos)
+        return alpha_pos, alpha_fit, curve, final_m
 
 
 # ============================================================================
-# 第6部分：权重灵敏度分析（改进4）
+# 第6部分：IGWO vs GWO 对比图 (4张独立, 适用于LaTeX单栏)
 # ============================================================================
 
-def sensitivity_analysis(sys, base_evaluator, save_to=None):
-    """
-    对照论文 Fig.7, 改变各子目标的权重系数, 观察对应子目标值的变化趋势
-    验证优化结果的鲁棒性, 确定合理的权重取值范围
-    """
-    import sys as _sys
-    print("\n" + "=" * 65)
-    print("  改进4: 权重灵敏度分析")
-    print("=" * 65)
-    _sys.stdout.flush()
-
-    # 轻量参数: 20 wolves, 50 iterations (灵敏度分析不需收敛到极致)
-    n_wolves = 20
-    max_iter = 50
-
-    # ---- 测试1: w1(有功损耗) 从0.10→0.70 变化 (5点) ----
-    print("\n  [Test 1] Varying w1 (P_loss weight)...")
-    _sys.stdout.flush()
-    w1_values = np.arange(0.10, 0.75, 0.15)  # 5点 (原7点→减半)
-    results_w1 = {'w1': [], 'P_loss': [], 'V_rise': [], 'V_drop': [],
-                  'delta_Q': [], 'V_pen': [], 'circle_pen': []}
-
-    for w1_val in w1_values:
-        remain = 1.0 - w1_val
-        w_rise = remain * 0.25
-        w_drop = remain * 0.30
-        w_delta = remain * 0.25
-
-        evaluator = FitnessEvaluator(sys)
-        evaluator.w1 = w1_val
-        evaluator.w2_rise = w_rise
-        evaluator.w2_drop = w_drop
-        evaluator.w3 = w_delta
-
-        igwo = ImprovedGWO(evaluator, sys.lb, sys.ub,
-                          n_wolves=n_wolves, max_iter=max_iter)
-        _, _, _, _, metrics = igwo.optimize(verbose=False)
-        results_w1['w1'].append(w1_val)
-        results_w1['P_loss'].append(metrics['P_loss'])
-        results_w1['V_rise'].append(metrics['V_rise'])
-        results_w1['V_drop'].append(metrics['V_drop'])
-        results_w1['delta_Q'].append(metrics['delta_Q'])
-        results_w1['V_pen'].append(metrics['V_pen'])
-        results_w1['circle_pen'].append(metrics['circle_pen'])
-        print(f"    w1={w1_val:.2f} | P_loss={metrics['P_loss']:.6f} | "
-              f"V_rise={metrics['V_rise']:.6f} | V_drop={metrics['V_drop']:.6f} | "
-              f"ΔQ={metrics['delta_Q']:.6f}")
-        _sys.stdout.flush()
-
-    # ---- 测试2: w3(ΔQ) 从0.05→0.50 变化 (5点) ----
-    print("\n  [Test 2] Varying w3 (ΔQ weight)...")
-    _sys.stdout.flush()
-    w3_values = np.arange(0.05, 0.55, 0.10)  # 5点
-    results_w3 = {'w3': [], 'P_loss': [], 'V_rise': [], 'V_drop': [],
-                  'delta_Q': [], 'V_pen': [], 'circle_pen': []}
-
-    for w3_val in w3_values:
-        remain = 1.0 - w3_val
-        w1 = remain * 0.35
-        w_rise = remain * 0.25
-        w_drop = remain * 0.35
-        w_delta = w3_val
-
-        evaluator = FitnessEvaluator(sys)
-        evaluator.w1 = w1
-        evaluator.w2_rise = w_rise
-        evaluator.w2_drop = w_drop
-        evaluator.w3 = w3_val
-
-        igwo = ImprovedGWO(evaluator, sys.lb, sys.ub,
-                          n_wolves=n_wolves, max_iter=max_iter)
-        _, _, _, _, metrics = igwo.optimize(verbose=False)
-        results_w3['w3'].append(w3_val)
-        results_w3['P_loss'].append(metrics['P_loss'])
-        results_w3['V_rise'].append(metrics['V_rise'])
-        results_w3['V_drop'].append(metrics['V_drop'])
-        results_w3['delta_Q'].append(metrics['delta_Q'])
-        results_w3['V_pen'].append(metrics['V_pen'])
-        results_w3['circle_pen'].append(metrics['circle_pen'])
-        print(f"    w3={w3_val:.2f} | P_loss={metrics['P_loss']:.6f} | "
-              f"V_rise={metrics['V_rise']:.6f} | V_drop={metrics['V_drop']:.6f} | "
-              f"ΔQ={metrics['delta_Q']:.6f}")
-        _sys.stdout.flush()
-
-    # ---- 绘图 ----
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle('Sensitivity Analysis — Effect of Weight Factors on Sub-Objectives\n'
-                 '(对照论文 Mahmoud 2020 Fig.7)', fontsize=13, fontweight='bold')
-
-    # Row 1: w1 variation
-    ax = axes[0, 0]
-    ax.plot(results_w1['w1'], results_w1['P_loss'], 'b-o', lw=1.5, ms=6)
-    ax.set_xlabel('w1 (P_loss weight)')
-    ax.set_ylabel('P_loss (pu)')
-    ax.set_title('P_loss vs w1')
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[0, 1]
-    ax.plot(results_w1['w1'], results_w1['V_rise'], 'r-s', lw=1.5, ms=6, label='V_rise')
-    ax.plot(results_w1['w1'], results_w1['V_drop'], 'b-^', lw=1.5, ms=6, label='V_drop')
-    ax.set_xlabel('w1 (P_loss weight)')
-    ax.set_ylabel('Voltage Deviation')
-    ax.set_title('V_rise / V_drop vs w1')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[0, 2]
-    ax.plot(results_w1['w1'], results_w1['delta_Q'], 'g-D', lw=1.5, ms=6)
-    ax.set_xlabel('w1 (P_loss weight)')
-    ax.set_ylabel('ΔQ')
-    ax.set_title('ΔQ vs w1')
-    ax.grid(True, alpha=0.3)
-
-    # Row 2: w3 variation
-    ax = axes[1, 0]
-    ax.plot(results_w3['w3'], results_w3['P_loss'], 'b-o', lw=1.5, ms=6)
-    ax.set_xlabel('w3 (ΔQ weight)')
-    ax.set_ylabel('P_loss (pu)')
-    ax.set_title('P_loss vs w3')
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 1]
-    ax.plot(results_w3['w3'], results_w3['V_rise'], 'r-s', lw=1.5, ms=6, label='V_rise')
-    ax.plot(results_w3['w3'], results_w3['V_drop'], 'b-^', lw=1.5, ms=6, label='V_drop')
-    ax.set_xlabel('w3 (ΔQ weight)')
-    ax.set_ylabel('Voltage Deviation')
-    ax.set_title('V_rise / V_drop vs w3')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    ax = axes[1, 2]
-    ax.plot(results_w3['w3'], results_w3['delta_Q'], 'g-D', lw=1.5, ms=6)
-    ax.set_xlabel('w3 (ΔQ weight)')
-    ax.set_ylabel('ΔQ')
-    ax.set_title('ΔQ vs w3')
-    ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    if save_to:
-        _stem = _osp.splitext(_osp.basename(save_to))[0]
-        _dir = _osp.dirname(save_to) or "."
-        export.save(fig, _stem, outdir=_dir, formats=("pdf", "png"))
-        print(f"\n  [Sensitivity fig saved] {_dir}/{_stem}.{{pdf,png}}")
-    plt.close()
-    return results_w1, results_w3
-
-def plot_results(sys, best_pos, best_fit, curve_igwo, a_vals, metrics,
-                 curve_gwo=None, fit_gwo=None, save_to=None):
-    """综合结果可视化（含改进后的新指标）"""
-    Q_opt = metrics.get('Q_applied')
-    if Q_opt is None:
-        Q_opt = best_pos.reshape(24, sys.n_dev)
-    V_opt = metrics['V_profile']
-
-    # 优化前基准：无功出力=0
-    zero_eval = FitnessEvaluator(sys)
-    _, base_m = zero_eval.evaluate(np.zeros_like(best_pos))
-    V_base = base_m.get('V_profile')
-    if V_base is None:
-        V_base = np.ones((24, sys.n_nodes))
-
-    fig, axes = plt.subplots(2, 4, figsize=(19, 10))
-    fig.suptitle('IGWO 改进灰狼算法 — 全天时电压/无功优化结果 (对照论文框架)', fontsize=13, fontweight='bold')
-
+def save_comparison_figures(sys, igwo_best, metrics_igwo, curve_igwo, fit_igwo,
+                            gwo_best, metrics_gwo, curve_gwo, fit_gwo, outdir):
+    r"""保存4张独立对比图，IEEE单栏宽度，适用于LaTeX \includegraphics"""
+    eval_fn = FitnessEvaluator(sys)
+    _, baseline = eval_fn.evaluate(np.zeros_like(igwo_best))
     h = np.arange(24)
 
-    # [0,0] 收敛曲线对比
-    ax = axes[0, 0]
-    ax.plot(curve_igwo, 'b-', lw=1.2, label=f'IGWO best={best_fit:.4f}')
-    if curve_gwo is not None and fit_gwo is not None:
-        ax.plot(curve_gwo, 'r--', lw=1.2, label=f'GWO best={fit_gwo:.4f}')
+    fig_w, fig_h = 3.5, 2.5  # IEEE single-column
+
+    # ---- Fig 1: Active Power Loss ----
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.plot(h, baseline['P_loss_h'], 'k-o', ms=3, lw=1.0,
+            label='Baseline (Q=0)')
+    ax.plot(h, metrics_gwo['P_loss_h'], 'b--s', ms=3, lw=1.0,
+            label='Standard GWO')
+    ax.plot(h, metrics_igwo['P_loss_h'], 'r-^', ms=3, lw=1.2,
+            label='Improved GWO')
+    ax.set_xlabel('Hour')
+    ax.set_ylabel('Active Power Loss (pu)')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout(pad=0.3)
+    export.save(fig, 'fig1_active_power_loss', outdir=outdir, formats=("pdf", "png"))
+    plt.close()
+
+    # ---- Fig 2: Voltage Deviation ----
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.plot(h, baseline['V_dev_h'], 'k-o', ms=3, lw=1.0,
+            label='Baseline (Q=0)')
+    ax.plot(h, metrics_gwo['V_dev_h'], 'b--s', ms=3, lw=1.0,
+            label='Standard GWO')
+    ax.plot(h, metrics_igwo['V_dev_h'], 'r-^', ms=3, lw=1.2,
+            label='Improved GWO')
+    ax.set_xlabel('Hour')
+    ax.set_ylabel(r'Voltage Deviation $\sum (V_i - V_{\mathrm{ref}})^2$')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout(pad=0.3)
+    export.save(fig, 'fig2_voltage_deviation', outdir=outdir, formats=("pdf", "png"))
+    plt.close()
+
+    # ---- Fig 3: Reactive Power Loss ----
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.plot(h, baseline['Q_loss_h'], 'k-o', ms=3, lw=1.0,
+            label='Baseline (Q=0)')
+    ax.plot(h, metrics_gwo['Q_loss_h'], 'b--s', ms=3, lw=1.0,
+            label='Standard GWO')
+    ax.plot(h, metrics_igwo['Q_loss_h'], 'r-^', ms=3, lw=1.2,
+            label='Improved GWO')
+    ax.set_xlabel('Hour')
+    ax.set_ylabel('Reactive Power Loss (pu)')
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout(pad=0.3)
+    export.save(fig, 'fig3_reactive_power_loss', outdir=outdir, formats=("pdf", "png"))
+    plt.close()
+
+    # ---- Fig 4: Convergence Curve ----
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    ax.plot(curve_igwo, 'r-', lw=1.2,
+            label=f'IGWO (best={fit_igwo:.4f})')
+    ax.plot(curve_gwo, 'b--', lw=1.2,
+            label=f'Standard GWO (best={fit_gwo:.4f})')
     ax.set_yscale('log')
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Fitness')
-    ax.set_title('Convergence Curve (IGWO vs GWO)')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-
-    # [0,1] 非线性收敛因子 a
-    ax = axes[0, 1]
-    ax.plot(a_vals, 'orange', lw=1.8)
-    ax.axhline(y=0, color='gray', ls='--')
-    ax.set_xlabel('Iteration')
-    ax.set_ylabel('a')
-    ax.set_title('Nonlinear Convergence Factor')
-    ax.grid(True, alpha=0.3)
-
-    # [0,2] 电压优化前后对比 + 升高/跌落分区
-    ax = axes[0, 2]
-    n_show = 1  # WT1节点
-    ax.plot(h, V_base[:, n_show], 'b-o', ms=3, label='Before', alpha=0.7)
-    ax.plot(h, V_opt[:, n_show], 'r-s', ms=3, label='After', alpha=0.7)
-    ax.axhline(sys.V_min, color='gray', ls='--', label=f'Vmin={sys.V_min}')
-    ax.axhline(sys.V_max, color='gray', ls='--', label=f'Vmax={sys.V_max}')
-    ax.axhline(sys.V_ref, color='green', ls=':', label='Vref=1.0')
-    # 填充升高/跌落区域 (改进3)
-    ax.fill_between(h, sys.V_ref, sys.V_max, alpha=0.08, color='red', label='Rise zone')
-    ax.fill_between(h, sys.V_min, sys.V_ref, alpha=0.08, color='blue', label='Drop zone')
-    ax.set_xlabel('Hour')
-    ax.set_ylabel('Voltage (pu)')
-    ax.set_title(f'Node {n_show} (WT1) Voltage')
-    ax.legend(fontsize=6.5)
-    ax.grid(True, alpha=0.3)
-
-    # [0,3] V_rise / V_drop per hour (改进3)
-    ax = axes[0, 3]
-    V_rise_h = np.sum(np.maximum(V_opt - sys.V_ref, 0)**2, axis=1)
-    V_drop_h = np.sum(np.maximum(sys.V_ref - V_opt, 0)**2, axis=1)
-    ax.bar(h - 0.15, V_rise_h, 0.3, color='red', alpha=0.7, label='V_rise')
-    ax.bar(h + 0.15, V_drop_h, 0.3, color='blue', alpha=0.7, label='V_drop')
-    ax.set_xlabel('Hour')
-    ax.set_ylabel('Deviation')
-    ax.set_title('V_rise / V_drop per Hour (改进3)')
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
-
-    # [1,0] 无功出力热力图 (含圆约束边界)
-    ax = axes[1, 0]
-    labels = ['WT1', 'WT2', 'WT3', 'SVG', 'Cap']
-    im = ax.imshow(Q_opt.T, aspect='auto', cmap='RdBu_r',
-                   vmin=-0.10, vmax=0.10, interpolation='nearest')
-    ax.set_xlabel('Hour')
-    ax.set_ylabel('Device')
-    ax.set_yticks(range(sys.n_dev))
-    ax.set_yticklabels(labels)
-    ax.set_title('Optimal Q Dispatch (pu) [with circle constraint]')
-    plt.colorbar(im, ax=ax, shrink=0.85)
-
-    # [1,1] 无功出力变化率 ΔQ per transition (改进1)
-    ax = axes[1, 1]
-    dQ_h = np.zeros(23)
-    for hh in range(23):
-        dQ_h[hh] = np.sum((Q_opt[hh+1] - Q_opt[hh])**2)
-    ax.bar(np.arange(23), dQ_h, 0.6, color='purple', alpha=0.7)
-    ax.set_xlabel('Hour transition')
-    ax.set_ylabel('ΔQ')
-    ax.set_title('ΔQ per Transition (改进1: cross-time coupling)')
-    ax.grid(True, alpha=0.3)
-
-    # [1,2] 风机无功圆约束可视化 (改进2)
-    ax = axes[1, 2]
-    for w in range(sys.n_wt):
-        P_h = sys.P_wt[w]
-        S = sys.S_wt[w]
-        q_max_h = np.sqrt(np.maximum(S**2 - P_h**2, 0))
-        ax.fill_between(h, -q_max_h, q_max_h, alpha=0.15,
-                        label=f'WT{w+1} Q-bound')
-        ax.plot(h, Q_opt[:, w], 'o-', ms=3, lw=1.2, label=f'WT{w+1} Q')
-    ax.set_xlabel('Hour')
-    ax.set_ylabel('Q (pu)')
-    ax.set_title('WT Q Limits (circle constraint, 改进2)')
-    ax.legend(fontsize=6.5)
-    ax.grid(True, alpha=0.3)
-
-    # [1,3] 数值总结
-    ax = axes[1, 3]
-    ax.axis('off')
-    loss_reduction = (1 - metrics['P_loss']/max(base_m['P_loss'], 1e-10)) * 100
-    v_rise_reduction = (1 - metrics['V_rise']/max(base_m['V_rise'], 1e-10)) * 100
-    v_drop_reduction = (1 - metrics['V_drop']/max(base_m['V_drop'], 1e-10)) * 100
-    summary = (
-        "==== Optimization Summary ====\n\n"
-        f"Best fitness:       {best_fit:.6f}\n"
-        f"Total P_loss:       {metrics['P_loss']:.6f} pu\n"
-        f"Loss reduction:     {loss_reduction:.2f}%\n"
-        f"V_rise:             {metrics['V_rise']:.6f} ({v_rise_reduction:.1f}%)\n"
-        f"V_drop:             {metrics['V_drop']:.6f} ({v_drop_reduction:.1f}%)\n"
-        f"ΔQ (cross-time):    {metrics['delta_Q']:.6f}\n"
-        f"V_penalty:          {metrics['V_pen']:.6f}\n"
-        f"Circle_pen:         {metrics['circle_pen']:.6f}\n\n"
-        f"--- Core Improvements ---\n"
-        f"1. Cross-time ΔQ\n"
-        f"2. Circle constraint\n"
-        f"3. Split V_rise/V_drop\n"
-        f"4. Nonlinear a(t)\n"
-        f"5. Delta fusion\n"
-        f"6. Weighted position update"
-    )
-    ax.text(0.05, 0.95, summary, transform=ax.transAxes, fontsize=8.5,
-            verticalalignment='top', fontfamily='monospace',
-            bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.9))
-
-    plt.tight_layout()
-    if save_to:
-        _stem = _osp.splitext(_osp.basename(save_to))[0]
-        _dir = _osp.dirname(save_to) or "."
-        export.save(fig, _stem, outdir=_dir, formats=("pdf", "png"))
-        print(f"[Fig saved] {_dir}/{_stem}.{{pdf,png}}")
+    plt.tight_layout(pad=0.3)
+    export.save(fig, 'fig4_convergence', outdir=outdir, formats=("pdf", "png"))
     plt.close()
-    return fig
+
+    print(f"\n[Figs saved] {outdir}/fig1..4_*.{{pdf,png}}")
 
 
 # ============================================================================
@@ -928,6 +730,7 @@ def plot_results(sys, best_pos, best_fit, curve_igwo, a_vals, metrics,
 # ============================================================================
 
 def main():
+    np.random.seed(42)
     print("=" * 65)
     print("  Improved GWO for All-Day Voltage & Reactive Power Optimization")
     print("  New Energy Power System — 7-bus Test Case")
@@ -954,16 +757,15 @@ def main():
     t_igwo = time.time() - t0
     print(f"\n  IGWO done in {t_igwo:.1f}s | Best fitness = {fit_igwo:.8f}")
     print(f"  P_loss = {metrics_igwo['P_loss']:.6f} pu")
+    print(f"  Q_loss = {metrics_igwo['Q_loss']:.6f} pu")
     print(f"  V_rise = {metrics_igwo['V_rise']:.6f}")
     print(f"  V_drop = {metrics_igwo['V_drop']:.6f}")
-    print(f"  ΔQ     = {metrics_igwo['delta_Q']:.6f}")
-    print(f"  Circle_pen = {metrics_igwo['circle_pen']:.6f}")
 
     # [4] 运行标准GWO对比
     print("\n[4/5] Running Standard GWO for comparison...")
     gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=30, max_iter=200)
     t1 = time.time()
-    best_gwo, fit_gwo, curve_gwo = gwo.optimize(verbose=False)
+    best_gwo, fit_gwo, curve_gwo, metrics_gwo = gwo.optimize(verbose=False)
     t_gwo = time.time() - t1
     print(f"  GWO done in {t_gwo:.1f}s | Best fitness = {fit_gwo:.8f}")
 
@@ -985,26 +787,19 @@ def main():
 
     # 优化前基准
     _, base_m = evaluator.evaluate(np.zeros_like(best_igwo))
-    print(f"\n  --- Before vs After ---")
-    print(f"  P_loss:  {base_m['P_loss']:.6f} -> {metrics_igwo['P_loss']:.6f} pu "
-          f"({(1-metrics_igwo['P_loss']/max(base_m['P_loss'],1e-10))*100:.1f}%)")
-    print(f"  V_rise:  {base_m['V_rise']:.6f} -> {metrics_igwo['V_rise']:.6f} "
-          f"({(1-metrics_igwo['V_rise']/max(base_m['V_rise'],1e-10))*100:.1f}%)")
-    print(f"  V_drop:  {base_m['V_drop']:.6f} -> {metrics_igwo['V_drop']:.6f} "
-          f"({(1-metrics_igwo['V_drop']/max(base_m['V_drop'],1e-10))*100:.1f}%)")
-    print(f"  ΔQ:      {base_m['delta_Q']:.6f} -> {metrics_igwo['delta_Q']:.6f}")
-    print(f"  V_pen:   {base_m['V_pen']:.6f} -> {metrics_igwo['V_pen']:.6f}")
-    print(f"  Circle_pen: {base_m['circle_pen']:.6f} -> {metrics_igwo['circle_pen']:.6f}")
+    print(f"\n  --- Before vs IGWO vs GWO ---")
+    print(f"  P_loss:  {base_m['P_loss']:.6f} -> IGWO={metrics_igwo['P_loss']:.6f} | "
+          f"GWO={metrics_gwo['P_loss']:.6f} pu")
+    print(f"  Q_loss:  {base_m['Q_loss']:.6f} -> IGWO={metrics_igwo['Q_loss']:.6f} | "
+          f"GWO={metrics_gwo['Q_loss']:.6f} pu")
+    print(f"  V_dev:   {base_m['V_rise']+base_m['V_drop']:.6f} -> "
+          f"IGWO={metrics_igwo['V_rise']+metrics_igwo['V_drop']:.6f} | "
+          f"GWO={metrics_gwo['V_rise']+metrics_gwo['V_drop']:.6f}")
 
-    # 画图
-    plot_results(sys, best_igwo, fit_igwo, curve_igwo, a_vals, metrics_igwo,
-                 curve_gwo=curve_gwo, fit_gwo=fit_gwo,
-                 save_to=r'D:\04_project\vscode\igwo_optimization_results.png')
-    print("\n  Results saved to: D:/04_project/vscode/igwo_optimization_results.png")
-
-    # ---- 改进4: 权重灵敏度分析 ----
-    sensitivity_analysis(sys, evaluator,
-                        save_to=r'D:\04_project\vscode\sensitivity_analysis.png')
+    # 画图: 4张独立图
+    outdir = r'D:\04_project\vscode'
+    save_comparison_figures(sys, best_igwo, metrics_igwo, curve_igwo, fit_igwo,
+                            best_gwo, metrics_gwo, curve_gwo, fit_gwo, outdir)
 
     print("\n" + "=" * 65)
     print(f"  Optimization complete! ({t_igwo:.1f}s IGWO | {t_gwo:.1f}s GWO)")
