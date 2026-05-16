@@ -37,160 +37,138 @@ plt.rcParams['font.sans-serif'] = ['Arial', 'Helvetica', 'SimHei', 'Microsoft Ya
 
 class WindFarmSystem:
     """
-    新能源发电测试系统 (7节点, SB=10MVA, VB=35kV)
+    IEEE 33-bus 新能源发电测试系统 (SB=10MVA, VB=12.66kV)
+    拓扑参考 Baran & Wu 1989
 
-    拓扑:
-      Node 0: PCC平衡节点 (V=1.0∠0°)
-      Node 1-3: 直驱风机 WT1, WT2, WT3 (PQ节点, 按Q设定值调节)
-      Node 4: SVG安装点 (PQ节点)
-      Node 5: 电容器组安装点 (PQ节点)
-      Node 6: 负荷节点 (PQ节点)
-
-            0 (PCC)
-           /|\
-          / | \
-         1  2  6 (负荷)
-         |  |  |
-         4--3--5
-         |_____|
-
-      线路: 0-1, 0-2, 0-6, 1-4, 2-5, 3-4, 4-5, 5-6
+    设备:
+      Node 1 (idx0): PCC平衡节点 + OLTC
+      Node 18 (idx17): WT1, Node 22 (idx21): WT2, Node 33 (idx32): WT3
+      Node 25 (idx24): SVG, Node 30 (idx29): 离散电容器
+      其余29节点: 分布式PQ负荷
     """
 
     def __init__(self):
-        self.SB = 10.0       # MVA 基准
-        self.VB = 35.0       # kV 基准
-        self.n_nodes = 7
+        self.SB = 10.0
+        self.VB = 12.66
+        self.n_nodes = 33
         self.n_time = 24
+        Zb = self.VB**2 / self.SB  # 16.03 Ω
 
-        # 线路: [from, to, R(pu), X(pu)]
-        # 35kV农网馈线 (~18-35km), ACSR-120导线, 阻抗回调30%
-        # Z_base = 35²/10 = 122.5 Ω
-        lines = np.array([
-            [0, 1, 0.062, 0.196],   # 0→WT1 主干 ~25km
-            [0, 2, 0.070, 0.224],   # 0→WT2 主干 ~28km
-            [0, 6, 0.091, 0.280],   # 0→负荷 主干 ~35km
-            [1, 4, 0.031, 0.098],   # WT1→SVG 分支 ~13km
-            [2, 5, 0.031, 0.098],   # WT2→Cap 分支 ~13km
-            [3, 4, 0.046, 0.147],   # WT3→SVG 分支 ~19km
-            [4, 5, 0.039, 0.123],   # SVG↔Cap 联络 ~16km
-            [5, 6, 0.023, 0.074],   # Cap→负荷 末端 ~9km
-        ])
+        # IEEE 33-bus 线路 (from, to, R_ohm, X_ohm) → pu
+        _L = np.array([
+            [1,2,0.0922,0.0470],[2,3,0.4930,0.2511],[3,4,0.3660,0.1864],
+            [4,5,0.3811,0.1941],[5,6,0.8190,0.7070],[6,7,0.1872,0.6188],
+            [7,8,0.7114,0.2351],[8,9,1.0300,0.7400],[9,10,1.0440,0.7400],
+            [10,11,0.1966,0.0650],[11,12,0.3744,0.1238],[12,13,1.4680,1.1550],
+            [13,14,0.5416,0.7129],[14,15,0.5910,0.5260],[15,16,0.7463,0.5450],
+            [16,17,1.2890,1.7210],[17,18,0.7320,0.5740],
+            [2,19,0.1640,0.1565],[19,20,1.5042,1.3554],[20,21,0.4095,0.4784],
+            [21,22,0.7089,0.9373],
+            [3,23,0.4512,0.3083],[23,24,0.8980,0.7091],[24,25,0.8960,0.7011],
+            [6,26,0.2030,0.1034],[26,27,0.2842,0.1447],[27,28,1.0590,0.9337],
+            [28,29,0.8042,0.7006],[29,30,0.5075,0.2585],[30,31,0.9744,0.9630],
+            [31,32,0.3105,0.3619],[32,33,0.3410,0.5302],
+        ], dtype=float)
+        lines_pu = _L.copy()
+        lines_pu[:,2] /= Zb
+        lines_pu[:,3] /= Zb
+        lines_pu[:,0] -= 1; lines_pu[:,1] -= 1  # 1-indexed → 0-indexed
+        lines = lines_pu
         self.n_lines = len(lines)
 
-        # 构建导纳矩阵
-        self.Ybus = np.zeros((self.n_nodes, self.n_nodes), dtype=complex)
-        for f, t, r, x in lines:
-            f, t = int(f), int(t)
-            y = 1.0 / (r + 1j * x)
-            self.Ybus[f, t] -= y
-            self.Ybus[t, f] -= y
-            self.Ybus[f, f] += y
-            self.Ybus[t, t] += y
-
+        # Ybus
+        self.Ybus = np.zeros((33,33), dtype=complex)
+        for f,t,r,x in lines:
+            f,t = int(f), int(t)
+            y = 1.0/(r+1j*x)
+            self.Ybus[f,t] -= y; self.Ybus[t,f] -= y
+            self.Ybus[f,f] += y; self.Ybus[t,t] += y
         self.G = np.real(self.Ybus)
         self.B = np.imag(self.Ybus)
 
-        # 存储线路数据用于损耗计算
         self.lines = np.array(lines)
-        self.line_g = np.array([r/(r*r + x*x) for _, _, r, x in lines])
-        self.line_b = np.array([x/(r*r + x*x) for _, _, r, x in lines])
+        self.line_g = np.array([r/(r*r+x*x) for _,_,r,x in lines])
+        self.line_b = np.array([x/(r*r+x*x) for _,_,r,x in lines])
 
         # 节点类型: 0=slack, 1=PQ
-        self.node_type = np.array([0, 1, 1, 1, 1, 1, 1])
         self.slack_node = 0
-        self.pq_nodes = np.where(self.node_type == 1)[0]
-        self.pv_nodes = np.where(self.node_type == 2)[0]
+        self.node_type = np.ones(33, dtype=int)
+        self.node_type[0] = 0
+        self.pq_nodes = np.where(self.node_type==1)[0]
+        self.pv_nodes = np.where(self.node_type==2)[0]
 
-        # 设备节点映射
-        self.wt_nodes  = [1, 2, 3]
-        self.svg_node  = 4
-        self.cap_node  = 5
-        self.load_node = 6
+        # 设备节点映射 (0-indexed)
+        self.wt_nodes  = [17, 21, 32]  # IEEE nodes 18,22,33
+        self.svg_node  = 24            # IEEE node 25
+        self.cap_node  = 29            # IEEE node 30
+        self.n_wt, self.n_svg, self.n_cap, self.n_oltc = 3,1,1,1
+        self.n_dev = 6
 
-        self.n_wt  = 3
-        self.n_svg = 1
-        self.n_cap = 1
-        self.n_oltc = 1
-        self.n_dev = self.n_wt + self.n_svg + self.n_cap + self.n_oltc  # 6
-
-        # 设备索引 (在24h展开中的offset)
-        self.idx_wt   = [0, 1, 2]
-        self.idx_svg  = 3
-        self.idx_cap  = 4
-        self.idx_oltc = 5
-
-        # 搜索空间维度 = 设备数 × 24时段
+        self.idx_wt=[0,1,2]; self.idx_svg=3; self.idx_cap=4; self.idx_oltc=5
         self.dim = self.n_dev * 24
 
-        # ---- 设备无功出力范围 (pu on SB) — 工程实际尺度 ----
-        self.wt_q_min  = np.array([-0.25, -0.25, -0.20])
-        self.wt_q_max  = np.array([ 0.25,  0.25,  0.20])
-        self.svg_q_min = -0.30
-        self.svg_q_max =  0.30
-        self.cap_q_min =  0.00
-        self.cap_q_max =  0.20
+        # 设备 Q 范围 (33-bus尺度)
+        self.wt_q_min = np.array([-0.08,-0.08,-0.06])
+        self.wt_q_max = np.array([ 0.08, 0.08, 0.06])
+        self.svg_q_min, self.svg_q_max = -0.12, 0.12
+        self.cap_q_min, self.cap_q_max =  0.00, 0.08
+        self.cap_step = 0.02; self.cap_n_steps = 4
+        self.cap_steps = np.arange(0,self.cap_n_steps+1)*self.cap_step
+        self.max_cap_switches = 5
 
-        # ---- 离散电容器分组投切 ----
-        # 5组电容器, 每组0.04pu, 构成6档: [0, 0.04, 0.08, 0.12, 0.16, 0.20] pu
-        self.cap_step = 0.04
-        self.cap_n_steps = 5
-        self.cap_steps = np.arange(0, self.cap_n_steps + 1) * self.cap_step
-        self.max_cap_switches = 5  # 每日最大投切次数
+        # OLTC
+        self.oltc_tap_min, self.oltc_tap_max = -4,4
+        self.oltc_step_pu = 0.025; self.max_oltc_changes = 6
 
-        # ---- 有载调压变压器 (OLTC) ----
-        # 9档位: ±10%, 步长2.5%
-        self.oltc_tap_min = -4
-        self.oltc_tap_max = 4
-        self.oltc_step_pu = 0.025
-        self.max_oltc_changes = 6  # 每日最大分接头变化次数
+        # 无功圆约束
+        self.S_wt = np.array([0.13,0.13,0.10])
+        self.S_svg = 0.12
 
-        # ---- 无功圆约束 (视在功率额定值) ----
-        self.S_wt = np.array([0.40, 0.40, 0.32])
-        self.S_svg = 0.30
-        self.S_svg = 0.30
+        # 上下限
+        ql = np.concatenate([self.wt_q_min,[self.svg_q_min],[self.cap_q_min],[self.oltc_tap_min]])
+        qu = np.concatenate([self.wt_q_max,[self.svg_q_max],[self.cap_q_max],[self.oltc_tap_max]])
+        self.lb = np.tile(ql,24); self.ub = np.tile(qu,24)
 
-        # 盒式上下限 (含OLTC档位)
-        ql_per_h = np.concatenate([self.wt_q_min, [self.svg_q_min], [self.cap_q_min], [self.oltc_tap_min]])
-        qu_per_h = np.concatenate([self.wt_q_max, [self.svg_q_max], [self.cap_q_max], [self.oltc_tap_max]])
-        self.lb = np.tile(ql_per_h, 24)
-        self.ub = np.tile(qu_per_h, 24)
+        self.V_min, self.V_max, self.V_ref = 0.90, 1.10, 1.00
 
-        # ---- 电压约束 ----
-        self.V_min = 0.90
-        self.V_max = 1.10
-        self.V_ref = 1.00
-
-        # ---- 日曲线 ----
         self._build_profiles()
 
     def _build_profiles(self):
-        """构建24h典型风电出力和负荷曲线 (工程实际尺度)"""
-        # 风电出力比 (反调峰: 夜高昼低)
+        """风电+分布式负荷 24h曲线"""
         wt_ratio = np.array([
-            0.85, 0.88, 0.90, 0.87, 0.82, 0.75, 0.65, 0.55,
-            0.45, 0.40, 0.38, 0.35, 0.33, 0.36, 0.42, 0.52,
-            0.65, 0.75, 0.82, 0.85, 0.88, 0.90, 0.92, 0.88
-        ])
-        # 风机额定功率 (MW): WT1=3.0, WT2=3.0, WT3=2.5 → 总装机8.5MW
-        wt_rated_MW = np.array([3.0, 3.0, 2.5])
+            0.85,0.88,0.90,0.87,0.82,0.75,0.65,0.55,
+            0.45,0.40,0.38,0.35,0.33,0.36,0.42,0.52,
+            0.65,0.75,0.82,0.85,0.88,0.90,0.92,0.88])
+        wt_MW = np.array([1.0,1.0,0.8])  # WT1=1MW,WT2=1MW,WT3=0.8MW
+        self.P_wt = np.zeros((3,24))
+        for i in range(3):
+            self.P_wt[i,:] = wt_ratio * wt_MW[i] / self.SB
 
-        self.P_wt = np.zeros((self.n_wt, 24))
-        for i in range(self.n_wt):
-            self.P_wt[i, :] = wt_ratio * wt_rated_MW[i] / self.SB
+        # IEEE 33-bus 基准负荷 (kW/kVar) → pu
+        load_kW = np.zeros(33)
+        load_kVar = np.zeros(33)
+        _ld = {
+            2:(100,60),3:(90,40),4:(120,80),5:(60,30),6:(60,20),
+            7:(200,100),8:(200,100),9:(60,20),10:(60,20),11:(45,30),
+            12:(60,35),13:(60,35),14:(120,80),15:(60,10),16:(60,20),
+            17:(60,20),18:(90,40),19:(90,40),20:(90,40),21:(90,40),
+            22:(90,40),23:(90,50),24:(420,200),25:(420,200),
+            26:(60,25),27:(60,25),28:(60,20),29:(120,70),
+            30:(200,600),31:(150,70),32:(210,100),33:(60,40)}
+        for k,(p,q) in _ld.items():
+            load_kW[k-1]=p; load_kVar[k-1]=q
+        self.P_load_base = load_kW / 1000 / self.SB
+        self.Q_load_base = load_kVar / 1000 / self.SB
 
-        # 负荷曲线: 晚高峰型 (居民/商业混合), 峰值19-20时(晚7-8点)
         load_ratio = np.array([
-            0.42, 0.38, 0.35, 0.33, 0.36, 0.42, 0.52, 0.68,   # 0-7h
-            0.80, 0.87, 0.90, 0.88, 0.85, 0.88, 0.90, 0.92,   # 8-15h
-            0.95, 0.98, 1.00, 1.00, 0.98, 0.95, 0.78, 0.52,   # 16-23h, 峰值18-20时
-        ])
-        self.P_load = load_ratio * 9.0 / self.SB   # 峰值9MW (0.90 pu)
-        self.Q_load = load_ratio * 4.0 / self.SB   # 峰值4.0MVar (0.40 pu)
+            0.42,0.38,0.35,0.33,0.36,0.42,0.52,0.68,
+            0.80,0.87,0.90,0.88,0.85,0.88,0.90,0.92,
+            0.95,0.98,1.00,1.00,0.98,0.95,0.78,0.52])
+        self.P_load = np.outer(self.P_load_base, load_ratio)  # (33,24)
+        self.Q_load = np.outer(self.Q_load_base, load_ratio)
 
-        # ΔQ 时变权重 — 高峰期微加重 (范围0.75~1.25, 避免过度压制Q调度)
-        base = load_ratio / np.mean(load_ratio)
-        self.delta_q_weights = 0.5 + 0.5 * base
+        base_w = load_ratio / np.mean(load_ratio)
+        self.delta_q_weights = 0.5 + 0.5 * base_w
 
 
 # ============================================================================
@@ -332,7 +310,7 @@ class FitnessEvaluator:
         self.w2_rise = 0.15    # 电压升高偏差
         self.w2_drop = 0.30    # 电压跌落偏差
         self.w3 = 0.10         # 跨时段无功变化率 ΔQ
-        self.lam = 500.0       # 电压越限惩罚 (防PSO作弊越限)
+        self.lam = 200.0       # 电压越限惩罚
         self.mu = 80.0         # 无功圆约束惩罚
         self.lam_cap_sw = 8.0  # 电容器日投切次数超标惩罚
         self.lam_oltc = 5.0    # OLTC日分接头变化次数超标惩罚
@@ -391,19 +369,14 @@ class FitnessEvaluator:
             Q_applied[h] = q
 
             # 构建节点注入
-            P_inj = np.zeros(sys.n_nodes)
-            Q_inj = np.zeros(sys.n_nodes)
+            P_inj = -sys.P_load[:, h].copy()  # 分布式负荷
+            Q_inj = -sys.Q_load[:, h].copy()
 
             for w in range(sys.n_wt):
-                P_inj[sys.wt_nodes[w]] = sys.P_wt[w, h]
-
-            P_inj[sys.load_node] = -sys.P_load[h]
-            Q_inj[sys.load_node] = -sys.Q_load[h]
-
-            for w in range(sys.n_wt):
-                Q_inj[sys.wt_nodes[w]] = q[w]
-            Q_inj[sys.svg_node] = q[sys.idx_svg]
-            Q_inj[sys.cap_node] = q[sys.idx_cap]
+                P_inj[sys.wt_nodes[w]] += sys.P_wt[w, h]
+                Q_inj[sys.wt_nodes[w]] += q[w]
+            Q_inj[sys.svg_node] += q[sys.idx_svg]
+            Q_inj[sys.cap_node] += q[sys.idx_cap]
 
             # OLTC调节平衡节点电压
             tap = int(q[sys.idx_oltc])
@@ -845,11 +818,11 @@ def main():
     # [1] 初始化系统
     print("\n[1/6] Building test system...")
     sys = WindFarmSystem()
-    print(f"  Nodes: {sys.n_nodes} | Devices: {sys.n_dev} "
-          f"(WT:{sys.n_wt} SVG:1 Cap:1 OLTC:1)")
+    print(f"  System: IEEE 33-bus | Nodes: {sys.n_nodes} | "
+          f"Devices: {sys.n_dev} (WT:{sys.n_wt} SVG:1 Cap:1 OLTC:1)")
     print(f"  Search dimension: {sys.dim} (= {sys.n_dev} devices x 24h)")
-    print(f"  Cap: discrete {sys.cap_n_steps+1} steps, OLTC: 9 taps, "
-          f"max_sw={sys.max_cap_switches}/{sys.max_oltc_changes}")
+    print(f"  Total load: {sys.P_load_base.sum()*sys.SB*1000:.0f}kW "
+          f"| Wind: 2.8MW")
 
     # [2] 初始化评估器
     print("\n[2/6] Initializing evaluator (Newton-Raphson PF)...")
@@ -858,7 +831,7 @@ def main():
     # [3] 运行IGWO
     print("\n[3/6] Running Improved GWO...")
     igwo = ImprovedGWO(evaluator, sys.lb, sys.ub,
-                       n_wolves=15, max_iter=50,
+                       n_wolves=15, max_iter=200,
                        a0=2.0, lam=1.8, k=1.3)
     t0 = time.time()
     best_igwo, fit_igwo, curve_igwo, a_vals, metrics_igwo = igwo.optimize(verbose=True)
@@ -873,7 +846,7 @@ def main():
 
     # [4] 运行标准GWO对比
     print("\n[4/6] Running Standard GWO for comparison...")
-    gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=15, max_iter=50)
+    gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=15, max_iter=200)
     t1 = time.time()
     best_gwo, fit_gwo, curve_gwo, metrics_gwo = gwo.optimize(verbose=False)
     t_gwo = time.time() - t1
@@ -881,7 +854,7 @@ def main():
 
     # [5] 运行PSO对比
     print("\n[5/6] Running PSO for comparison...")
-    pso = PSO(evaluator, sys.lb, sys.ub, n_particles=15, max_iter=50)
+    pso = PSO(evaluator, sys.lb, sys.ub, n_particles=15, max_iter=200)
     t2 = time.time()
     best_pso, fit_pso, curve_pso, metrics_pso = pso.optimize(verbose=False)
     t_pso = time.time() - t2
