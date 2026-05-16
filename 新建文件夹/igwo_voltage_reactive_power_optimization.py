@@ -179,14 +179,18 @@ class WindFarmSystem:
         for i in range(self.n_wt):
             self.P_wt[i, :] = wt_ratio * wt_rated_MW[i] / self.SB
 
-        # 负荷曲线 (昼高夜低), 峰值9MW/4.0MVar (重载农网馈线)
+        # 负荷曲线: 晚高峰型 (居民/商业混合), 峰值19-20时(晚7-8点)
         load_ratio = np.array([
-            0.50, 0.45, 0.42, 0.40, 0.42, 0.55, 0.72, 0.85,
-            0.92, 0.95, 0.97, 0.93, 0.88, 0.90, 0.95, 0.98,
-            1.00, 0.95, 0.88, 0.82, 0.75, 0.70, 0.62, 0.55
+            0.42, 0.38, 0.35, 0.33, 0.36, 0.42, 0.52, 0.68,   # 0-7h
+            0.80, 0.87, 0.90, 0.88, 0.85, 0.88, 0.90, 0.92,   # 8-15h
+            0.95, 0.98, 1.00, 1.00, 0.98, 0.95, 0.78, 0.52,   # 16-23h, 峰值18-20时
         ])
         self.P_load = load_ratio * 9.0 / self.SB   # 峰值9MW (0.90 pu)
         self.Q_load = load_ratio * 4.0 / self.SB   # 峰值4.0MVar (0.40 pu)
+
+        # ΔQ 时变权重 — 高峰期微加重 (范围0.75~1.25, 避免过度压制Q调度)
+        base = load_ratio / np.mean(load_ratio)
+        self.delta_q_weights = 0.5 + 0.5 * base
 
 
 # ============================================================================
@@ -453,11 +457,12 @@ class FitnessEvaluator:
                 elif V[i] > sys.V_max:
                     total_V_pen += (V[i] - sys.V_max)**2
 
-        # ---- 跨时段无功变化率 (仅Q设备, 不含OLTC) ----
+        # ---- 跨时段无功变化率 (仅Q设备, 高峰期加权) ----
         n_q_dev = sys.n_wt + sys.n_svg + sys.n_cap
         for h in range(23):
+            w_h = sys.delta_q_weights[h]  # 高峰期ΔQ权重更大
             for d in range(n_q_dev):
-                total_delta_Q += (Q_applied[h+1, d] - Q_applied[h, d])**2
+                total_delta_Q += w_h * (Q_applied[h+1, d] - Q_applied[h, d])**2
 
         # ---- 日投切/调压次数约束 ----
         cap_sw_pen = 0.0
@@ -794,8 +799,8 @@ def main():
     # [3] 运行IGWO
     print("\n[3/5] Running Improved GWO...")
     igwo = ImprovedGWO(evaluator, sys.lb, sys.ub,
-                       n_wolves=20, max_iter=200,
-                       a0=2.0, lam=1.8, k=1.2)
+                       n_wolves=20, max_iter=300,
+                       a0=2.0, lam=1.8, k=1.0)
     t0 = time.time()
     best_igwo, fit_igwo, curve_igwo, a_vals, metrics_igwo = igwo.optimize(verbose=True)
     t_igwo = time.time() - t0
