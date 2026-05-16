@@ -64,17 +64,17 @@ class WindFarmSystem:
         self.n_time = 24
 
         # 线路: [from, to, R(pu), X(pu)]
-        # 35kV农网长馈线 (25-40km), ACSR-120导线: R≈0.27 Ω/km, X≈0.35 Ω/km
-        # Z_base = 35²/10 = 122.5 Ω, per-unit ≈ 0.0022/km
+        # 35kV农网馈线 (~18-35km), ACSR-120导线, 阻抗回调30%
+        # Z_base = 35²/10 = 122.5 Ω
         lines = np.array([
-            [0, 1, 0.088, 0.280],   # 0→WT1 主干 ~35km
-            [0, 2, 0.100, 0.320],   # 0→WT2 主干 ~40km
-            [0, 6, 0.130, 0.400],   # 0→负荷 主干 ~50km (远端)
-            [1, 4, 0.044, 0.140],   # WT1→SVG 分支 ~18km
-            [2, 5, 0.044, 0.140],   # WT2→Cap 分支 ~18km
-            [3, 4, 0.066, 0.210],   # WT3→SVG 分支 ~27km
-            [4, 5, 0.055, 0.175],   # SVG↔Cap 联络 ~22km
-            [5, 6, 0.033, 0.105],   # Cap→负荷 末端 ~13km
+            [0, 1, 0.062, 0.196],   # 0→WT1 主干 ~25km
+            [0, 2, 0.070, 0.224],   # 0→WT2 主干 ~28km
+            [0, 6, 0.091, 0.280],   # 0→负荷 主干 ~35km
+            [1, 4, 0.031, 0.098],   # WT1→SVG 分支 ~13km
+            [2, 5, 0.031, 0.098],   # WT2→Cap 分支 ~13km
+            [3, 4, 0.046, 0.147],   # WT3→SVG 分支 ~19km
+            [4, 5, 0.039, 0.123],   # SVG↔Cap 联络 ~16km
+            [5, 6, 0.023, 0.074],   # Cap→负荷 末端 ~9km
         ])
         self.n_lines = len(lines)
 
@@ -199,7 +199,7 @@ class PowerFlow:
     def __init__(self, sys: WindFarmSystem):
         self.sys = sys
         self.tol = 1e-8
-        self.max_iter = 30
+        self.max_iter = 15
 
     def solve(self, P_inj, Q_inj, V_slack=1.0):
         """
@@ -794,8 +794,8 @@ def main():
     # [3] 运行IGWO
     print("\n[3/5] Running Improved GWO...")
     igwo = ImprovedGWO(evaluator, sys.lb, sys.ub,
-                       n_wolves=30, max_iter=200,
-                       a0=2.0, lam=1.8, k=1.5)
+                       n_wolves=20, max_iter=200,
+                       a0=2.0, lam=1.8, k=1.2)
     t0 = time.time()
     best_igwo, fit_igwo, curve_igwo, a_vals, metrics_igwo = igwo.optimize(verbose=True)
     t_igwo = time.time() - t0
@@ -809,7 +809,7 @@ def main():
 
     # [4] 运行标准GWO对比
     print("\n[4/5] Running Standard GWO for comparison...")
-    gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=30, max_iter=200)
+    gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=20, max_iter=150)
     t1 = time.time()
     best_gwo, fit_gwo, curve_gwo, metrics_gwo = gwo.optimize(verbose=False)
     t_gwo = time.time() - t1
