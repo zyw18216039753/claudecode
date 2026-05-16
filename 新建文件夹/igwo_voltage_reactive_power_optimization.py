@@ -207,7 +207,8 @@ class PowerFlow:
 
     def solve(self, P_inj, Q_inj, V_slack=1.0):
         """
-        输入: P_inj[n], Q_inj[n], V_slack (OLTC调节后的平衡节点电压)
+        向量化牛顿-拉夫逊法潮流求解器 (任意节点数)
+        输入: P_inj[n], Q_inj[n], V_slack
         输出: V[n], theta[n], converged
         """
         sys = self.sys
@@ -217,98 +218,90 @@ class PowerFlow:
         pq = sys.pq_nodes
         pv = sys.pv_nodes
 
-        non_slack = np.concatenate([pv, pq])
+        non_slack = np.concatenate([pv, pq]).astype(int)
         n_ns = len(non_slack)
+        n_pq = len(pq)
+        n_unk = n_ns + n_pq
 
         V = np.ones(n)
-        V[slack] = V_slack  # OLTC调节平衡节点电压
+        V[slack] = V_slack
         theta = np.zeros(n)
 
-        # 未知量索引: dθ for all non-slack, then dV for PQ only
-        n_pq = len(pq)
-        n_unk = n_ns + n_pq  # 6 + 3 = 9
+        # 预提取子矩阵 (缓存)
+        G_ns = G[non_slack][:, non_slack]
+        B_ns = B[non_slack][:, non_slack]
+        V2_diag_ns = V[non_slack]**2
+
+        if n_pq > 0:
+            pq_in_ns = [list(non_slack).index(p) for p in pq]
+            G_np = G[non_slack][:, pq]
+            B_np = B[non_slack][:, pq]
+            G_pn = G[pq][:, non_slack]
+            B_pn = B[pq][:, non_slack]
+            G_pp = G[pq][:, pq]
+            B_pp = B[pq][:, pq]
 
         for it in range(self.max_iter):
-            # ---- 计算计算功率和失配量 ----
-            P_calc = np.zeros(n)
-            Q_calc = np.zeros(n)
-            for i in range(n):
-                for j in range(n):
-                    ang = theta[i] - theta[j]
-                    P_calc[i] += V[i] * V[j] * (G[i,j] * np.cos(ang) + B[i,j] * np.sin(ang))
-                    Q_calc[i] += V[i] * V[j] * (G[i,j] * np.sin(ang) - B[i,j] * np.cos(ang))
+            # ---- 向量化功率计算 ----
+            th_diff = theta[:, None] - theta[None, :]
+            cos_td, sin_td = np.cos(th_diff), np.sin(th_diff)
+            VV = V[:, None] * V[None, :]
+            P_calc = np.sum(VV * (G * cos_td + B * sin_td), axis=1)
+            Q_calc = np.sum(VV * (G * sin_td - B * cos_td), axis=1)
 
-            dP = P_inj - P_calc
-            dQ = Q_inj - Q_calc
-
-            # 失配量向量: [dP_non_slack; dQ_pq]
             mismatch = np.zeros(n_unk)
-            mismatch[:n_ns] = dP[non_slack]          # dP for PV + PQ
-            mismatch[n_ns:] = dQ[pq]                  # dQ for PQ only
+            mismatch[:n_ns] = P_inj[non_slack] - P_calc[non_slack]
+            if n_pq > 0:
+                mismatch[n_ns:] = Q_inj[pq] - Q_calc[pq]
 
             if np.max(np.abs(mismatch)) < self.tol:
                 return V, theta, True
 
-            # ---- 构建解析雅可比矩阵 ----
-            # J = [H  N]   H = dP/dθ,  N = dP/dV * V
-            #     [K  L]   K = dQ/dθ,  L = dQ/dV * V
+            # ---- 向量化雅可比构建 ----
             J = np.zeros((n_unk, n_unk))
 
-            for row_i, i in enumerate(non_slack):
-                for col_j, j in enumerate(non_slack):
-                    ang = theta[i] - theta[j]
-                    if i == j:
-                        # H_ii = -Q_i - B_ii * V_i^2
-                        J[row_i, col_j] = -Q_calc[i] - B[i,i] * V[i]**2
-                    else:
-                        # H_ij = V_i * V_j * (G_ij * sin(ang) - B_ij * cos(ang))
-                        J[row_i, col_j] = V[i] * V[j] * (G[i,j] * np.sin(ang) - B[i,j] * np.cos(ang))
+            # H = ∂P_ns/∂θ_ns
+            th_ns = theta[non_slack]
+            th_diff_ns = th_ns[:, None] - th_ns[None, :]
+            VV_ns = V[non_slack][:, None] * V[non_slack][None, :]
+            H = VV_ns * (G_ns * np.sin(th_diff_ns) - B_ns * np.cos(th_diff_ns))
+            np.fill_diagonal(H, -Q_calc[non_slack] - np.diag(B_ns) * V2_diag_ns)
+            J[:n_ns, :n_ns] = H
 
-                # N = dP/dV * V
-                for col_j, j in enumerate(pq):  # only PQ nodes have dV
-                    col = n_ns + col_j
-                    if i == j:
-                        # N_ii = P_i + G_ii * V_i^2
-                        J[row_i, col] = P_calc[i] + G[i,i] * V[i]**2
-                    else:
-                        ang = theta[i] - theta[j]
-                        # N_ij = V_i * V_j * (G_ij * cos(ang) + B_ij * sin(ang))
-                        J[row_i, col] = V[i] * V[j] * (G[i,j] * np.cos(ang) + B[i,j] * np.sin(ang))
+            if n_pq > 0:
+                # N = ∂P_ns/∂V_pq * V_pq
+                V_np = V[non_slack][:, None] * V[pq][None, :]
+                th_np = theta[non_slack][:, None] - theta[pq][None, :]
+                N_mat = V_np * (G_np * np.cos(th_np) + B_np * np.sin(th_np))
+                for k, (r, c) in enumerate(zip(pq_in_ns, range(n_pq))):
+                    N_mat[r, c] = P_calc[pq[k]] + G[pq[k], pq[k]] * V[pq[k]]**2
+                J[:n_ns, n_ns:] = N_mat
 
-            # K = dQ/dθ  (only for PQ nodes)
-            for row_i, i in enumerate(pq):
-                row = n_ns + row_i
-                for col_j, j in enumerate(non_slack):
-                    ang = theta[i] - theta[j]
-                    if i == j:
-                        # K_ii = P_i - G_ii * V_i^2
-                        J[row, col_j] = P_calc[i] - G[i,i] * V[i]**2
-                    else:
-                        # K_ij = -V_i * V_j * (G_ij * cos(ang) + B_ij * sin(ang))
-                        J[row, col_j] = -V[i] * V[j] * (G[i,j] * np.cos(ang) + B[i,j] * np.sin(ang))
+                # K = ∂Q_pq/∂θ_ns
+                V_pn = V[pq][:, None] * V[non_slack][None, :]
+                th_pn = theta[pq][:, None] - theta[non_slack][None, :]
+                K_mat = -V_pn * (G_pn * np.cos(th_pn) + B_pn * np.sin(th_pn))
+                for k, (r, c) in enumerate(zip(range(n_pq), pq_in_ns)):
+                    K_mat[r, c] = P_calc[pq[k]] - G[pq[k], pq[k]] * V[pq[k]]**2
+                J[n_ns:, :n_ns] = K_mat
 
-                # L = dQ/dV * V (only for PQ nodes)
-                for col_j, j in enumerate(pq):
-                    col = n_ns + col_j
-                    if i == j:
-                        # L_ii = Q_i - B_ii * V_i^2
-                        J[row, col] = Q_calc[i] - B[i,i] * V[i]**2
-                    else:
-                        ang = theta[i] - theta[j]
-                        # L_ij = V_i * V_j * (G_ij * sin(ang) - B_ij * cos(ang))
-                        J[row, col] = V[i] * V[j] * (G[i,j] * np.sin(ang) - B[i,j] * np.cos(ang))
+                # L = ∂Q_pq/∂V_pq * V_pq
+                V_pp = V[pq][:, None] * V[pq][None, :]
+                th_pp = theta[pq][:, None] - theta[pq][None, :]
+                L_mat = V_pp * (G_pp * np.sin(th_pp) - B_pp * np.cos(th_pp))
+                np.fill_diagonal(L_mat, Q_calc[pq] - np.diag(B_pp) * V[pq]**2)
+                J[n_ns:, n_ns:] = L_mat
 
-            # 求解修正方程
             try:
                 dx = np.linalg.solve(J, mismatch)
             except np.linalg.LinAlgError:
                 dx = np.linalg.lstsq(J, mismatch, rcond=None)[0]
 
-            # 更新变量
             theta[non_slack] += dx[:n_ns]
-            V[pq] += dx[n_ns:]
+            if n_pq > 0:
+                V[pq] += dx[n_ns:]
+            V2_diag_ns = V[non_slack]**2
 
-        # 不收敛
         return V, theta, False
 
 
@@ -339,7 +332,7 @@ class FitnessEvaluator:
         self.w2_rise = 0.15    # 电压升高偏差
         self.w2_drop = 0.30    # 电压跌落偏差
         self.w3 = 0.10         # 跨时段无功变化率 ΔQ
-        self.lam = 150.0       # 电压越限惩罚
+        self.lam = 500.0       # 电压越限惩罚 (防PSO作弊越限)
         self.mu = 80.0         # 无功圆约束惩罚
         self.lam_cap_sw = 8.0  # 电容器日投切次数超标惩罚
         self.lam_oltc = 5.0    # OLTC日分接头变化次数超标惩罚
@@ -694,11 +687,65 @@ class StandardGWO:
 
 
 # ============================================================================
-# 第6部分：IGWO vs GWO 对比图 (4张独立, 适用于LaTeX单栏)
+# 第6部分：对比算法 — PSO
+# ============================================================================
+
+class PSO:
+    """标准粒子群优化 (PSO) — 惯性权重 + 全局最优"""
+
+    def __init__(self, evaluator, lb, ub, n_particles=20, max_iter=150):
+        self.eval_fn = evaluator
+        self.lb, self.ub = lb, ub
+        self.dim = len(lb)
+        self.N = n_particles
+        self.T = max_iter
+        self.w, self.c1, self.c2 = 0.7, 1.5, 1.5
+        self.v_max = 0.2 * (ub - lb)
+
+    def optimize(self, verbose=False):
+        pos = self.lb + np.random.rand(self.N, self.dim) * (self.ub - self.lb)
+        vel = np.random.randn(self.N, self.dim) * self.v_max * 0.1
+        fit = np.array([self.eval_fn.evaluate(p)[0] for p in pos])
+
+        pbest_pos = pos.copy()
+        pbest_fit = fit.copy()
+        gbest_idx = np.argmin(fit)
+        gbest_pos = pos[gbest_idx].copy()
+        gbest_fit = fit[gbest_idx]
+        curve = np.zeros(self.T)
+
+        for t in range(self.T):
+            r1 = np.random.rand(self.N, self.dim)
+            r2 = np.random.rand(self.N, self.dim)
+            vel = (self.w * vel + self.c1 * r1 * (pbest_pos - pos) +
+                   self.c2 * r2 * (gbest_pos - pos))
+            vel = np.clip(vel, -self.v_max, self.v_max)
+            pos = np.clip(pos + vel, self.lb, self.ub)
+
+            fit = np.array([self.eval_fn.evaluate(p)[0] for p in pos])
+
+            improved = fit < pbest_fit
+            pbest_pos[improved] = pos[improved]
+            pbest_fit[improved] = fit[improved]
+
+            best_idx = np.argmin(fit)
+            if fit[best_idx] < gbest_fit:
+                gbest_pos = pos[best_idx].copy()
+                gbest_fit = fit[best_idx]
+
+            curve[t] = gbest_fit
+
+        _, final_m = self.eval_fn.evaluate(gbest_pos)
+        return gbest_pos, gbest_fit, curve, final_m
+
+
+# ============================================================================
+# 第7部分：IGWO vs 对比算法 图表输出
 # ============================================================================
 
 def save_comparison_figures(sys, igwo_best, metrics_igwo, curve_igwo, fit_igwo,
-                            gwo_best, metrics_gwo, curve_gwo, fit_gwo, outdir):
+                            gwo_best, metrics_gwo, curve_gwo, fit_gwo, outdir,
+                            metrics_pso=None, curve_pso=None, fit_pso=None):
     r"""保存4张独立对比图，IEEE单栏宽度，适用于LaTeX \includegraphics"""
     eval_fn = FitnessEvaluator(sys)
     _, baseline = eval_fn.evaluate(np.zeros_like(igwo_best))
@@ -710,13 +757,16 @@ def save_comparison_figures(sys, igwo_best, metrics_igwo, curve_igwo, fit_igwo,
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.plot(h, baseline['P_loss_h'], 'k-o', ms=3, lw=1.0,
             label='Baseline (Q=0)')
+    if metrics_pso is not None:
+        ax.plot(h, metrics_pso['P_loss_h'], 'm-.d', ms=3, lw=1.0,
+                label='PSO')
     ax.plot(h, metrics_gwo['P_loss_h'], 'b--s', ms=3, lw=1.0,
             label='Standard GWO')
     ax.plot(h, metrics_igwo['P_loss_h'], 'r-^', ms=3, lw=1.2,
             label='Improved GWO')
     ax.set_xlabel('Hour')
     ax.set_ylabel('Active Power Loss (pu)')
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=6.5)
     ax.grid(True, alpha=0.3)
     plt.tight_layout(pad=0.3)
     export.save(fig, 'fig1_active_power_loss', outdir=outdir, formats=("pdf", "png"))
@@ -726,13 +776,16 @@ def save_comparison_figures(sys, igwo_best, metrics_igwo, curve_igwo, fit_igwo,
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.plot(h, baseline['V_dev_h'], 'k-o', ms=3, lw=1.0,
             label='Baseline (Q=0)')
+    if metrics_pso is not None:
+        ax.plot(h, metrics_pso['V_dev_h'], 'm-.d', ms=3, lw=1.0,
+                label='PSO')
     ax.plot(h, metrics_gwo['V_dev_h'], 'b--s', ms=3, lw=1.0,
             label='Standard GWO')
     ax.plot(h, metrics_igwo['V_dev_h'], 'r-^', ms=3, lw=1.2,
             label='Improved GWO')
     ax.set_xlabel('Hour')
     ax.set_ylabel(r'Voltage Deviation $\sum (V_i - V_{\mathrm{ref}})^2$')
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=6.5)
     ax.grid(True, alpha=0.3)
     plt.tight_layout(pad=0.3)
     export.save(fig, 'fig2_voltage_deviation', outdir=outdir, formats=("pdf", "png"))
@@ -742,24 +795,30 @@ def save_comparison_figures(sys, igwo_best, metrics_igwo, curve_igwo, fit_igwo,
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.plot(h, baseline['Q_loss_h'], 'k-o', ms=3, lw=1.0,
             label='Baseline (Q=0)')
+    if metrics_pso is not None:
+        ax.plot(h, metrics_pso['Q_loss_h'], 'm-.d', ms=3, lw=1.0,
+                label='PSO')
     ax.plot(h, metrics_gwo['Q_loss_h'], 'b--s', ms=3, lw=1.0,
             label='Standard GWO')
     ax.plot(h, metrics_igwo['Q_loss_h'], 'r-^', ms=3, lw=1.2,
             label='Improved GWO')
     ax.set_xlabel('Hour')
     ax.set_ylabel('Reactive Power Loss (pu)')
-    ax.legend(fontsize=7)
+    ax.legend(fontsize=6.5)
     ax.grid(True, alpha=0.3)
     plt.tight_layout(pad=0.3)
     export.save(fig, 'fig3_reactive_power_loss', outdir=outdir, formats=("pdf", "png"))
     plt.close()
 
-    # ---- Fig 4: Convergence Curve ----
+    # ---- Fig 4: Convergence Curves (IGWO vs GWO vs PSO) ----
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     ax.plot(curve_igwo, 'r-', lw=1.2,
             label=f'IGWO (best={fit_igwo:.4f})')
-    ax.plot(curve_gwo, 'b--', lw=1.2,
-            label=f'Standard GWO (best={fit_gwo:.4f})')
+    ax.plot(curve_gwo, 'b--', lw=1.1,
+            label=f'GWO (best={fit_gwo:.4f})')
+    if curve_pso is not None and fit_pso is not None:
+        ax.plot(curve_pso, 'g-.', lw=1.0,
+                label=f'PSO (best={fit_pso:.4f})')
     ax.set_yscale('log')
     ax.set_xlabel('Iteration')
     ax.set_ylabel('Fitness')
@@ -784,7 +843,7 @@ def main():
     print("=" * 65)
 
     # [1] 初始化系统
-    print("\n[1/5] Building test system...")
+    print("\n[1/6] Building test system...")
     sys = WindFarmSystem()
     print(f"  Nodes: {sys.n_nodes} | Devices: {sys.n_dev} "
           f"(WT:{sys.n_wt} SVG:1 Cap:1 OLTC:1)")
@@ -793,14 +852,14 @@ def main():
           f"max_sw={sys.max_cap_switches}/{sys.max_oltc_changes}")
 
     # [2] 初始化评估器
-    print("\n[2/5] Initializing evaluator (Newton-Raphson PF)...")
+    print("\n[2/6] Initializing evaluator (Newton-Raphson PF)...")
     evaluator = FitnessEvaluator(sys)
 
     # [3] 运行IGWO
-    print("\n[3/5] Running Improved GWO...")
+    print("\n[3/6] Running Improved GWO...")
     igwo = ImprovedGWO(evaluator, sys.lb, sys.ub,
-                       n_wolves=20, max_iter=300,
-                       a0=2.0, lam=1.8, k=1.0)
+                       n_wolves=15, max_iter=50,
+                       a0=2.0, lam=1.8, k=1.3)
     t0 = time.time()
     best_igwo, fit_igwo, curve_igwo, a_vals, metrics_igwo = igwo.optimize(verbose=True)
     t_igwo = time.time() - t0
@@ -813,17 +872,25 @@ def main():
           f"OLTC_pen = {metrics_igwo.get('oltc_pen',0):.4f}")
 
     # [4] 运行标准GWO对比
-    print("\n[4/5] Running Standard GWO for comparison...")
-    gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=20, max_iter=150)
+    print("\n[4/6] Running Standard GWO for comparison...")
+    gwo = StandardGWO(evaluator, sys.lb, sys.ub, n_wolves=15, max_iter=50)
     t1 = time.time()
     best_gwo, fit_gwo, curve_gwo, metrics_gwo = gwo.optimize(verbose=False)
     t_gwo = time.time() - t1
     print(f"  GWO done in {t_gwo:.1f}s | Best fitness = {fit_gwo:.8f}")
 
-    # [5] 输出结果
+    # [5] 运行PSO对比
+    print("\n[5/6] Running PSO for comparison...")
+    pso = PSO(evaluator, sys.lb, sys.ub, n_particles=15, max_iter=50)
+    t2 = time.time()
+    best_pso, fit_pso, curve_pso, metrics_pso = pso.optimize(verbose=False)
+    t_pso = time.time() - t2
+    print(f"  PSO done in {t_pso:.1f}s | Best fitness = {fit_pso:.8f}")
+
+    # [6] 输出结果
     Q_opt = best_igwo.reshape(24, sys.n_dev)
 
-    print("\n[5/5] Optimal dispatch (Q in MVar, OLTC as tap position):")
+    print("\n[6/6] Optimal dispatch (Q in MVar, OLTC as tap position):")
     hdr = f"  {'Hour':>6s}"
     for d in ['WT1', 'WT2', 'WT3', 'SVG', 'Cap(MVar)', 'OLTC(tap)']:
         hdr += f" {d:>10s}"
@@ -841,22 +908,28 @@ def main():
 
     # 优化前基准
     _, base_m = evaluator.evaluate(np.zeros_like(best_igwo))
-    print(f"\n  --- Before vs IGWO vs GWO ---")
-    print(f"  P_loss:  {base_m['P_loss']:.6f} -> IGWO={metrics_igwo['P_loss']:.6f} | "
-          f"GWO={metrics_gwo['P_loss']:.6f} pu")
-    print(f"  Q_loss:  {base_m['Q_loss']:.6f} -> IGWO={metrics_igwo['Q_loss']:.6f} | "
-          f"GWO={metrics_gwo['Q_loss']:.6f} pu")
+    print(f"\n  --- Before vs PSO vs GWO vs IGWO ---")
+    print(f"  P_loss:  {base_m['P_loss']:.6f} -> "
+          f"PSO={metrics_pso['P_loss']:.6f} | "
+          f"GWO={metrics_gwo['P_loss']:.6f} | "
+          f"IGWO={metrics_igwo['P_loss']:.6f} pu")
+    print(f"  Q_loss:  {base_m['Q_loss']:.6f} -> "
+          f"PSO={metrics_pso['Q_loss']:.6f} | "
+          f"GWO={metrics_gwo['Q_loss']:.6f} | "
+          f"IGWO={metrics_igwo['Q_loss']:.6f} pu")
     print(f"  V_dev:   {base_m['V_rise']+base_m['V_drop']:.6f} -> "
-          f"IGWO={metrics_igwo['V_rise']+metrics_igwo['V_drop']:.6f} | "
-          f"GWO={metrics_gwo['V_rise']+metrics_gwo['V_drop']:.6f}")
+          f"PSO={metrics_pso['V_rise']+metrics_pso['V_drop']:.6f} | "
+          f"GWO={metrics_gwo['V_rise']+metrics_gwo['V_drop']:.6f} | "
+          f"IGWO={metrics_igwo['V_rise']+metrics_igwo['V_drop']:.6f}")
 
     # 画图: 4张独立图
     outdir = r'D:\04_project\vscode'
     save_comparison_figures(sys, best_igwo, metrics_igwo, curve_igwo, fit_igwo,
-                            best_gwo, metrics_gwo, curve_gwo, fit_gwo, outdir)
+                            best_gwo, metrics_gwo, curve_gwo, fit_gwo, outdir,
+                            metrics_pso=metrics_pso, curve_pso=curve_pso, fit_pso=fit_pso)
 
     print("\n" + "=" * 65)
-    print(f"  Optimization complete! ({t_igwo:.1f}s IGWO | {t_gwo:.1f}s GWO)")
+    print(f"  Done! IGWO={t_igwo:.0f}s | GWO={t_gwo:.0f}s | PSO={t_pso:.0f}s")
     print("=" * 65)
 
 
